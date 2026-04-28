@@ -25,7 +25,7 @@ $title = $pageTitle ?? 'Boutique PHP';
     </header>
 
     <main class="container page">
-        <?php foreach (consume_flash_messages() as $flash): ?>
+        <?php foreach (flash_messages() as $flash): ?>
             <div class="alert alert-<?php echo e($flash['type']); ?>" role="status">
                 <?php echo e($flash['message']); ?>
             </div>
