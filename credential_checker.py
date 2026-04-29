@@ -3,10 +3,13 @@
 Scanner de fichiers .txt : détecte des clés AWS, SendGrid, Brevo, SMTP,
 valide via les APIs / connexions, récupère le quota quand c'est possible,
 et envoie un résumé sur Telegram (secrets masqués).
+Mode --watch : surveillance en temps réel des .txt (création / modification).
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,10 +18,22 @@ import ssl
 import sys
 import urllib.error
 import urllib.parse
+import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+
+try:
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
+    FileSystemEventHandler = object  # type: ignore[misc, assignment]
+    Observer = None  # type: ignore[misc, assignment]
 
 
 # --- Regex d'extraction (faux positifs possibles ; validation filtre) ---
@@ -112,6 +127,7 @@ class Hit:
     detail: str
     quota: str = ""
     masked_id: str = ""
+    fp: str = ""
 
     def emoji_title(self) -> str:
         em = {
@@ -314,69 +330,91 @@ def validate_smtp(host: str, port: str, user: str, password: str) -> tuple[bool,
         return False, f"SMTP: {e}", ""
 
 
+def fingerprint(kind: str, *parts: str) -> str:
+    h = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return f"{kind}:{h[:24]}"
+
+
+def scan_single_file(fp: Path, folder: Path) -> list[Hit]:
+    """Analyse un seul fichier .txt et retourne les hits (validation incluse)."""
+    hits: list[Hit] = []
+    text = read_file_text(fp)
+    try:
+        rel = str(fp.relative_to(folder))
+    except ValueError:
+        rel = str(fp)
+
+    for ak, sk in extract_aws_pairs(text):
+        ok, msg, q = validate_aws(ak, sk)
+        hits.append(
+            Hit(
+                kind="aws",
+                source_file=rel,
+                valid=ok,
+                detail=msg,
+                quota=q,
+                masked_id=mask_secret(ak, 6),
+                fp=fingerprint("aws", ak, sk),
+            )
+        )
+
+    for sg in extract_sendgrid_keys(text):
+        ok, msg, q = validate_sendgrid(sg)
+        hits.append(
+            Hit(
+                kind="sendgrid",
+                source_file=rel,
+                valid=ok,
+                detail=msg,
+                quota=q,
+                masked_id=mask_secret(sg, 8),
+                fp=fingerprint("sendgrid", sg),
+            )
+        )
+
+    for bk in extract_brevo_keys(text):
+        ok, msg, q = validate_brevo(bk)
+        hits.append(
+            Hit(
+                kind="brevo",
+                source_file=rel,
+                valid=ok,
+                detail=msg,
+                quota=q,
+                masked_id=mask_secret(bk, 10),
+                fp=fingerprint("brevo", bk),
+            )
+        )
+
+    for sm in extract_smtp_configs(text):
+        ok, msg, q = validate_smtp(
+            sm["host"], sm["port"], sm["user"], sm["password"]
+        )
+        hits.append(
+            Hit(
+                kind="smtp",
+                source_file=rel,
+                valid=ok,
+                detail=msg,
+                quota=q,
+                masked_id=f"{sm['user']} @ {sm['host']}",
+                fp=fingerprint(
+                    "smtp",
+                    sm["host"],
+                    sm["port"],
+                    sm["user"],
+                    sm["password"],
+                ),
+            )
+        )
+
+    return hits
+
+
 def scan_folder(folder: Path) -> list[Hit]:
     hits: list[Hit] = []
     for fp in iter_txt_files(folder):
-        text = read_file_text(fp)
-        try:
-            rel = str(fp.relative_to(folder))
-        except ValueError:
-            rel = str(fp)
-
-        for ak, sk in extract_aws_pairs(text):
-            ok, msg, q = validate_aws(ak, sk)
-            hits.append(
-                Hit(
-                    kind="aws",
-                    source_file=rel,
-                    valid=ok,
-                    detail=msg,
-                    quota=q,
-                    masked_id=mask_secret(ak, 6),
-                )
-            )
-
-        for sg in extract_sendgrid_keys(text):
-            ok, msg, q = validate_sendgrid(sg)
-            hits.append(
-                Hit(
-                    kind="sendgrid",
-                    source_file=rel,
-                    valid=ok,
-                    detail=msg,
-                    quota=q,
-                    masked_id=mask_secret(sg, 8),
-                )
-            )
-
-        for bk in extract_brevo_keys(text):
-            ok, msg, q = validate_brevo(bk)
-            hits.append(
-                Hit(
-                    kind="brevo",
-                    source_file=rel,
-                    valid=ok,
-                    detail=msg,
-                    quota=q,
-                    masked_id=mask_secret(bk, 10),
-                )
-            )
-
-        for sm in extract_smtp_configs(text):
-            ok, msg, q = validate_smtp(
-                sm["host"], sm["port"], sm["user"], sm["password"]
-            )
-            hits.append(
-                Hit(
-                    kind="smtp",
-                    source_file=rel,
-                    valid=ok,
-                    detail=msg,
-                    quota=q,
-                    masked_id=f"{sm['user']} @ {sm['host']}",
-                )
-            )
-
+        hits.extend(scan_single_file(fp, folder))
     return hits
 
 
@@ -404,6 +442,23 @@ def format_telegram_html(hits: list[Hit], folder: str) -> str:
     return "\n".join(lines).strip()
 
 
+def format_realtime_html(h: Hit, folder: str, event: str = "nouveau") -> str:
+    """Un message court pour une notification immédiate (temps réel)."""
+    status = "✅" if h.valid else "❌"
+    lines = [
+        "⚡ <b>Temps réel</b> — " + html_escape(event),
+        f"📁 <code>{html_escape(folder)}</code>",
+        "",
+        f"{h.emoji_title()} {status}",
+        f"📄 <code>{html_escape(h.source_file)}</code>",
+        f"🔑 <code>{html_escape(h.masked_id)}</code>",
+        f"ℹ️ {html_escape(h.detail)}",
+    ]
+    if h.quota:
+        lines.append(f"📈 {html_escape(h.quota)}")
+    return "\n".join(lines)
+
+
 def html_escape(s: str) -> str:
     return (
         s.replace("&", "&amp;")
@@ -412,9 +467,201 @@ def html_escape(s: str) -> str:
     )
 
 
+class DebouncedTxtProcessor:
+    """Anti-rebond + dédoublonnage des empreintes pour le mode temps réel."""
+
+    def __init__(
+        self,
+        root: Path,
+        token: str,
+        chat_id: str,
+        debounce_s: float,
+        only_valid: bool,
+        notified_fps: set[str],
+    ) -> None:
+        self.root = root
+        self.token = token
+        self.chat_id = chat_id
+        self.debounce_s = debounce_s
+        self.only_valid = only_valid
+        self.notified_fps = notified_fps
+        self._lock = threading.Lock()
+        self._timers: dict[str, threading.Timer] = {}
+
+    def _is_under_root(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _do_scan(self, path: Path) -> None:
+        with self._lock:
+            self._timers.pop(str(path.resolve()), None)
+        if not path.is_file() or path.suffix.lower() != ".txt":
+            return
+        if not self._is_under_root(path):
+            return
+        try:
+            hits = scan_single_file(path, self.root)
+        except OSError as e:
+            print(f"Lecture impossible {path}: {e}", file=sys.stderr)
+            return
+        for h in hits:
+            if self.only_valid and not h.valid:
+                continue
+            if h.fp in self.notified_fps:
+                continue
+            self.notified_fps.add(h.fp)
+            msg = format_realtime_html(h, str(self.root), event="fichier .txt modifié")
+            if len(msg) > 4000:
+                msg = msg[:3900] + "\n\n⚠️ <i>tronqué</i>"
+            ok, err = send_telegram_message(self.token, self.chat_id, msg)
+            if ok:
+                print(f"📤 Telegram: {h.kind} ({'OK' if h.valid else 'FAIL'}) — {h.source_file}")
+            else:
+                print(f"❌ Telegram: {err}", file=sys.stderr)
+
+    def schedule(self, path: Path) -> None:
+        key = str(path.resolve())
+        with self._lock:
+            old = self._timers.pop(key, None)
+            if old is not None:
+                old.cancel()
+            t = threading.Timer(self.debounce_s, self._do_scan, args=(path,))
+            self._timers[key] = t
+            t.start()
+
+    def cancel_pending(self) -> None:
+        with self._lock:
+            timers = list(self._timers.values())
+            self._timers.clear()
+        for t in timers:
+            t.cancel()
+
+
+if _WATCHDOG_AVAILABLE:
+
+    class TxtWatchHandler(FileSystemEventHandler):
+        def __init__(self, processor: DebouncedTxtProcessor) -> None:
+            super().__init__()
+            self.processor = processor
+
+        def on_created(self, event: FileSystemEvent) -> None:
+            if event.is_directory:
+                return
+            p = Path(event.src_path)
+            if p.suffix.lower() == ".txt":
+                self.processor.schedule(p)
+
+        def on_moved(self, event: FileSystemEvent) -> None:
+            if getattr(event, "is_directory", False):
+                return
+            dest = getattr(event, "dest_path", None)
+            if dest:
+                p = Path(dest)
+                if p.suffix.lower() == ".txt":
+                    self.processor.schedule(p)
+
+        def on_modified(self, event: FileSystemEvent) -> None:
+            if event.is_directory:
+                return
+            p = Path(event.src_path)
+            if p.suffix.lower() == ".txt":
+                self.processor.schedule(p)
+
+def run_watch(
+    root: Path,
+    token: str,
+    chat_id: str,
+    debounce_s: float,
+    only_valid: bool,
+    notify_existing: bool,
+) -> int:
+    if not _WATCHDOG_AVAILABLE or Observer is None:
+        print(
+            "watchdog requis pour le mode temps réel: pip install watchdog",
+            file=sys.stderr,
+        )
+        return 1
+
+    notified: set[str] = set()
+    processor = DebouncedTxtProcessor(
+        root, token, chat_id, debounce_s, only_valid, notified
+    )
+
+    # Scan initial : enregistrer les empreintes déjà présentes (pas de spam au démarrage)
+    print("⏳ Scan initial (baseline)…")
+    initial_hits = scan_folder(root)
+    for h in initial_hits:
+        notified.add(h.fp)
+    print(f"   {len(initial_hits)} hit(s) déjà connus — ignorés sauf si --watch-notify-existing")
+
+    if notify_existing:
+        to_send = initial_hits if not only_valid else [h for h in initial_hits if h.valid]
+        for h in to_send:
+            msg = format_realtime_html(h, str(root), event="déjà présent au démarrage")
+            if len(msg) > 4000:
+                msg = msg[:3900] + "\n\n⚠️ <i>tronqué</i>"
+            ok, err = send_telegram_message(token, chat_id, msg)
+            if not ok:
+                print(f"❌ Telegram: {err}", file=sys.stderr)
+
+    observer = Observer()
+    observer.schedule(TxtWatchHandler(processor), str(root), recursive=True)
+    observer.start()
+    print(f"\n👀 Surveillance temps réel de <{root}> (Ctrl+C pour arrêter)\n")
+
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nArrêt…")
+        processor.cancel_pending()
+        observer.stop()
+    observer.join(timeout=5)
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Détecte AWS / SendGrid / Brevo / SMTP dans des .txt, valide, quota, Telegram."
+    )
+    parser.add_argument(
+        "folder",
+        nargs="?",
+        default=None,
+        help="Dossier à analyser (sinon demandé en interactif)",
+    )
+    parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Surveiller le dossier en temps réel (nouveaux .txt / modifications)",
+    )
+    parser.add_argument(
+        "--debounce",
+        type=float,
+        default=0.8,
+        metavar="SEC",
+        help="Délai anti-rebond avant analyse après une modification (défaut: 0.8)",
+    )
+    parser.add_argument(
+        "--watch-notify-existing",
+        action="store_true",
+        help="Au démarrage du --watch, envoyer aussi Telegram pour les hits déjà présents",
+    )
+    parser.add_argument(
+        "--notify-invalid",
+        action="store_true",
+        help="En mode watch, notifier aussi les détections invalides",
+    )
+    args = parser.parse_args()
+
     print("=== Checker AWS / SendGrid / Brevo / SMTP → Telegram ===\n")
-    folder_s = input("Dossier à analyser (contenant des .txt) : ").strip().strip('"').strip("'")
+    folder_s = (args.folder or "").strip() or input(
+        "Dossier à analyser (contenant des .txt) : "
+    ).strip().strip('"').strip("'")
     if not folder_s:
         print("Dossier vide.", file=sys.stderr)
         return 1
@@ -434,11 +681,22 @@ def main() -> int:
         print("Token ou chat_id manquant — impossible d'envoyer sur Telegram.", file=sys.stderr)
         return 1
 
+    only_valid = not args.notify_invalid
+
+    if args.watch:
+        return run_watch(
+            root,
+            token,
+            chat,
+            debounce_s=max(0.1, args.debounce),
+            only_valid=only_valid,
+            notify_existing=args.watch_notify_existing,
+        )
+
     print("\n⏳ Scan en cours…")
     hits = scan_folder(root)
     msg = format_telegram_html(hits, str(root))
 
-    # Telegram limite ~4096 caractères
     if len(msg) > 4000:
         msg = msg[:3900] + "\n\n⚠️ <i>Message tronqué (trop long)</i>"
 
@@ -450,7 +708,6 @@ def main() -> int:
         print(f"❌ Échec envoi: {err}", file=sys.stderr)
         return 1
 
-    # Résumé console (sans secrets)
     print("\n--- Résumé ---")
     for h in hits:
         print(f"  [{h.kind}] {'OK' if h.valid else 'FAIL'} {h.source_file} {h.masked_id}")
