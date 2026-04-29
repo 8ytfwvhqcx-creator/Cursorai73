@@ -56,6 +56,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
 </head>
 <body>
     <div class="card">
+        <?php require __DIR__ . '/includes/partials_snap_brand.php'; ?>
         <h1 class="title">Confirmez votre profil</h1>
         <p class="subtitle">Est-ce bien votre profil Snapchat ?</p>
 
@@ -65,8 +66,9 @@ $css = require __DIR__ . '/includes/snap_styles.php';
 
         <div class="profile-box">
             <div class="snapcode" aria-hidden="true">
-                <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                    <path fill="#fff" stroke="#000" stroke-width="2.5" d="M50 8 C28 8 12 28 12 48 c0 8 3 16 8 22 C12 78 8 88 8 92 h84 c0-4-4-14-12-22 5-6 8-14 8-22 C88 28 72 8 50 8z M38 58 c4 6 10 10 12 10 s8-4 12-10"/>
+                <svg class="snap-ghost" viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg" focusable="false">
+                    <path fill="#FFFFFF" stroke="#000000" stroke-width="2.8" stroke-linejoin="round" d="M54 12c-21.5 0-37 16.2-37 36.2 0 7.8 2.6 15 7 20.2-7.2 6.8-11 15.4-11 19.6h82c0-4.2-3.8-12.8-11-19.6 4.4-5.2 7-12.4 7-20.2C91 28.2 75.5 12 54 12z"/>
+                    <path fill="none" stroke="#000000" stroke-width="2.4" stroke-linecap="round" d="M40 58c4.5 7 9.8 11 14 11s9.5-4 14-11"/>
                 </svg>
             </div>
             <p class="pseudo-chip" style="margin:0"><?= htmlspecialchars($display, ENT_QUOTES, 'UTF-8') ?></p>
