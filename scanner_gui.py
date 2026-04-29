@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import END, BOTH, LEFT, filedialog, messagebox, scrolledtext
+from tkinter import END, BOTH, LEFT, W, filedialog, messagebox, scrolledtext
 import tkinter as tk
 
 # --- même idée que le binaire Go (évite de saturer le réseau) ---
