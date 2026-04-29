@@ -138,4 +138,33 @@ return <<<CSS
             margin: 0;
             padding: 0;
         }
+        .form-loading { position: relative; pointer-events: none; opacity: 0.65; }
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 252, 0, 0.88);
+        }
+        .loading-overlay.is-visible { display: flex; }
+        .loading-box {
+            background: #fff;
+            padding: 1.5rem 2rem;
+            border-radius: 20px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+            text-align: center;
+        }
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            margin: 0 auto 1rem;
+            border: 4px solid #eee;
+            border-top-color: #000;
+            border-radius: 50%;
+            animation: spin 0.75s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-text { font-weight: 700; color: #000; font-size: 0.95rem; }
 CSS;

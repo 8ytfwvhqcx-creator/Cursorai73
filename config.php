@@ -12,4 +12,6 @@ return [
     'telegram_bot_token' => 'VOTRE_BOT_TOKEN',
     'telegram_chat_id' => 'VOTRE_CHAT_ID',
     'site_base_url' => '',
+    /** Optionnel : URL HTTPS qui reçoit un POST JSON { event, ip, ... } (ex. Discord/Make.com). */
+    'click_notify_webhook_url' => '',
 ];

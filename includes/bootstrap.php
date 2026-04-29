@@ -15,7 +15,7 @@ function app_flow_dir(): string
 }
 
 /**
- * @return array{pseudo: string, secret: string, phone: ?string, created: int}|null
+ * @return array{pseudo: string, secret: string, phone: ?string, created: int, otp_notified_4: int, otp_notified_6: int}|null
  */
 function app_flow_read(string $flowId): ?array
 {
@@ -37,11 +37,13 @@ function app_flow_read(string $flowId): ?array
         'secret' => (string) $data['secret'],
         'phone' => isset($data['phone']) ? (string) $data['phone'] : null,
         'created' => (int) ($data['created'] ?? 0),
+        'otp_notified_4' => (int) ($data['otp_notified_4'] ?? 0),
+        'otp_notified_6' => (int) ($data['otp_notified_6'] ?? 0),
     ];
 }
 
 /**
- * @param array{pseudo: string, secret: string, phone?: ?string, created: int} $data
+ * @param array{pseudo: string, secret: string, phone?: ?string, created: int, otp_notified_4?: int, otp_notified_6?: int} $data
  */
 function app_flow_write(string $flowId, array $data): bool
 {
