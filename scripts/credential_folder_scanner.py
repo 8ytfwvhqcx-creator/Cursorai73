@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-r'''
-Scan de dossier (fichiers texte) pour motifs de credentials courants, avec
-validation optionnelle (AWS, SendGrid, Brevo, SMTP) et notification Telegram.
-
-USAGE LÉGITIME UNIQUEMENT : n'utilisez ce script que sur des dossiers dont vous
-êtes propriétaire ou pour lesquels vous avez une autorisation écrite. Les clés
-détectées ne sont jamais envoyées en clair sur Telegram (masquage).
-
-Dépendances : pip install -r scripts/requirements-credential-scanner.txt
-
-Variables d'environnement utiles :
-  TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  -> envoi via api.telegram.org
-  ou TELEGRAM_WEBHOOK_URL -> POST JSON avec champ text (voir API Telegram)
-
-Exemple :
-  python scripts/credential_folder_scanner.py --verify
-'''
-
 from __future__ import annotations
 
 import argparse
@@ -34,8 +16,6 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode
-
-# --- Constantes ---
 
 TEXT_EXTENSIONS = {
     ".txt",
@@ -62,7 +42,6 @@ TEXT_EXTENSIONS = {
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
-# AWS key id (20 chars, starts with AKIA or ASIA for temp)
 RE_AWS_ACCESS_KEY = re.compile(
     r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b",
     re.MULTILINE,
@@ -82,7 +61,6 @@ RE_BREVO = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# smtp://user:pass@host:port ou host + user + password séparés (heuristique)
 RE_SMTP_URL = re.compile(
     r"smtp(?:s)?://([^:/@]+):([^@]+)@([^:/]+)(?::(\d+))?",
     re.IGNORECASE,
@@ -144,7 +122,6 @@ def iter_text_files(root: Path) -> Iterable[Path]:
 
 
 def extract_aws_pairs(content: str, file_path: Path) -> list[AwsPair]:
-    """Associe access keys proches de secret keys (fenêtre de lignes)."""
     lines = content.splitlines()
     access_positions: list[tuple[int, str]] = []
     for i, line in enumerate(lines):
@@ -153,7 +130,6 @@ def extract_aws_pairs(content: str, file_path: Path) -> list[AwsPair]:
     if not access_positions:
         return []
     pairs: list[AwsPair] = []
-    full_text_lower = content
     for line_no, ak in access_positions:
         window_start = max(0, line_no - 5)
         window_end = min(len(lines), line_no + 6)
@@ -163,7 +139,6 @@ def extract_aws_pairs(content: str, file_path: Path) -> list[AwsPair]:
             if sk == ak:
                 continue
             pairs.append(AwsPair(ak, sk, str(file_path), line_no + 1))
-    # dédoublonner
     seen: set[str] = set()
     out: list[AwsPair] = []
     for p in pairs:
@@ -203,7 +178,6 @@ def extract_brevo_keys(content: str, file_path: Path) -> list[tuple[str, str]]:
 def extract_smtp_from_content(content: str, file_path: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    # Ignorer les lignes commentées (évite faux positifs dans le code source)
     filtered = "\n".join(
         ln for ln in content.splitlines() if not ln.lstrip().startswith("#")
     )
@@ -476,30 +450,11 @@ def run_verify(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Analyse un dossier (fichiers texte) pour motifs AWS/SendGrid/Brevo/SMTP.",
-    )
-    parser.add_argument(
-        "--folder",
-        type=Path,
-        help="Dossier à analyser (sinon dialogue graphique si tkinter disponible)",
-    )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Appelle les APIs pour valider et lire les quotas (nécessite réseau et deps).",
-    )
-    parser.add_argument(
-        "--smtp-test-to",
-        type=str,
-        default=None,
-        help="Si défini avec --verify, envoie un mail de test à cette adresse après login SMTP.",
-    )
-    parser.add_argument(
-        "--telegram-smtp-hit",
-        action="store_true",
-        help="Envoie un message style HIT sur Telegram pour chaque SMTP fonctionnel (variables TELEGRAM_*).",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder", type=Path)
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--smtp-test-to", type=str, default=None)
+    parser.add_argument("--telegram-smtp-hit", action="store_true")
     args = parser.parse_args()
 
     root = args.folder
@@ -525,11 +480,6 @@ def main() -> int:
 
     if args.verify:
         run_verify(bundle, args.smtp_test_to, args.telegram_smtp_hit)
-    else:
-        print(
-            "\nMode extraction seule. Ajoutez --verify pour tester les credentials "
-            "(SendGrid/Brevo quotas, AWS STS+SES toutes régions, SMTP login).",
-        )
 
     return 0
 
