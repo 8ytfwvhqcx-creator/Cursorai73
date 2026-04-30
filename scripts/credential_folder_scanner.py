@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r'''
 Scan de dossier (fichiers texte) pour motifs de credentials courants, avec
 validation optionnelle (AWS, SendGrid, Brevo, SMTP) et notification Telegram.
 
@@ -10,12 +10,12 @@ détectées ne sont jamais envoyées en clair sur Telegram (masquage).
 Dépendances : pip install -r scripts/requirements-credential-scanner.txt
 
 Variables d'environnement utiles :
-  TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  → envoi via api.telegram.org
-  ou TELEGRAM_WEBHOOK_URL                 → POST JSON {"text": "..."} (adapter selon votre webhook)
+  TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  -> envoi via api.telegram.org
+  ou TELEGRAM_WEBHOOK_URL -> POST JSON avec champ text (voir API Telegram)
 
 Exemple :
   python scripts/credential_folder_scanner.py --verify
-"""
+'''
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ class HitSummary:
 def _mask_secret(s: str, keep_start: int = 4, keep_end: int = 4) -> str:
     if len(s) <= keep_start + keep_end + 3:
         return "***"
-    return f"{s[:keep_start]}…{s[-keep_end:]}"
+    return f"{s[:keep_start]}...{s[-keep_end:]}"
 
 
 def _dedupe_key(parts: Iterable[str]) -> str:
@@ -286,7 +286,7 @@ def send_telegram_hit(message: str, parse_mode: str | None = None) -> bool:
 
 
 def format_hit_banner(kind: str, status: str, masked: str, extra: str = "") -> str:
-    line = f"🎯 HIT [{kind}] — {status}\nCredential: {masked}"
+    line = f"[HIT] [{kind}] - {status}\nCredential: {masked}"
     if extra:
         line += f"\n{extra}"
     return line
@@ -427,7 +427,7 @@ def run_verify(
         for r, q in regions[:15]:
             extra_lines.append(f"  {r}: {q}")
         if len(regions) > 15:
-            extra_lines.append(f"  … +{len(regions) - 15} région(s)")
+            extra_lines.append(f"  ... +{len(regions) - 15} region(s)")
         extra = "\n".join(extra_lines)
         status = "FONCTIONNEL" if ok else "ÉCHEC"
         print(format_hit_banner("AWS", status, masked, extra))
