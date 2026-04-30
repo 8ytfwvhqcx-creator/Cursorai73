@@ -1,4 +1,5 @@
 {
   "bot_token": "PASTE_BOT_TOKEN",
-  "chat_id": "PASTE_CHAT_ID"
+  "chat_id": "PASTE_CHAT_ID",
+  "insecure_ssl": false
 }

@@ -255,6 +255,28 @@ def dedupe_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ssl_insecure() -> bool:
+    v = os.environ.get("CREDENTIAL_SCANNER_INSECURE_SSL", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _ssl_context_for_url(url: str) -> ssl.SSLContext | None:
+    if not url.lower().startswith("https:"):
+        return None
+    ctx = ssl.create_default_context()
+    if _ssl_insecure():
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
+    ctx = _ssl_context_for_url(req.full_url)
+    if ctx is not None:
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def http_json(
     url: str,
     method: str = "GET",
@@ -266,7 +288,7 @@ def http_json(
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             ct = resp.headers.get("Content-Type", "")
             if "json" in ct or body.strip().startswith("{"):
@@ -279,6 +301,8 @@ def http_json(
         except json.JSONDecodeError:
             parsed = raw
         return e.code, parsed
+    except urllib.error.URLError as e:
+        return 0, f"urlerror:{e.reason!s}"[:500]
 
 
 def _script_dir() -> Path:
@@ -293,6 +317,8 @@ def _load_local_telegram() -> tuple[str | None, str | None]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None, None
+    if data.get("insecure_ssl") in (True, 1, "1", "true", "yes"):
+        os.environ["CREDENTIAL_SCANNER_INSECURE_SSL"] = "1"
     token = data.get("bot_token") or data.get("TELEGRAM_BOT_TOKEN")
     chat = data.get("chat_id") or data.get("TELEGRAM_CHAT_ID")
     if token is not None:
@@ -332,7 +358,7 @@ def http_post_json(
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             if raw.strip().startswith("{"):
                 return resp.status, json.loads(raw)
@@ -344,6 +370,8 @@ def http_post_json(
         except json.JSONDecodeError:
             parsed = err_body
         return e.code, parsed
+    except urllib.error.URLError as e:
+        return 0, f"urlerror:{e.reason!s}"[:500]
 
 
 def _telegram_text_limit() -> int:
@@ -376,7 +404,7 @@ def send_functional_hit(hit: dict[str, Any]) -> bool:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _urlopen(req, 20.0) as resp:
                 return 200 <= resp.status < 300
         except urllib.error.URLError:
             return False
@@ -620,7 +648,12 @@ def main() -> int:
     p.add_argument("--verify", action="store_true")
     p.add_argument("--scan-only", action="store_true")
     p.add_argument("--smtp-test-to", type=str, default=None)
+    p.add_argument("--insecure-ssl", action="store_true")
     args = p.parse_args()
+
+    if args.insecure_ssl:
+        os.environ["CREDENTIAL_SCANNER_INSECURE_SSL"] = "1"
+    _load_local_telegram()
 
     do_verify = args.verify or (not args.scan_only and _has_telegram_target())
 
@@ -646,6 +679,12 @@ def main() -> int:
     )
 
     if do_verify:
+        try:
+            import boto3
+        except ImportError:
+            boto3 = None
+        if boto3 is None and bundle.get("aws"):
+            print("install boto3 for AWS: pip install boto3", file=sys.stderr)
         run_verify(bundle, args.smtp_test_to)
 
     return 0
