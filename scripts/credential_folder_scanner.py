@@ -87,7 +87,7 @@ class AwsPair:
 def _mask_secret(s: str, keep_start: int = 4, keep_end: int = 4) -> str:
     if len(s) <= keep_start + keep_end + 3:
         return "***"
-    return f"{s[:keep_start]}...{s[-keep_end:]}"
+    return f"{s[:keep_start]}..{s[-keep_end:]}"
 
 
 def _dedupe_key(parts: Iterable[str]) -> str:
