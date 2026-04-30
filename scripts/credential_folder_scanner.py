@@ -11,7 +11,6 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Iterable
@@ -67,20 +66,20 @@ RE_SMTP_URL = re.compile(
 )
 
 
-@dataclass
 class AwsPair:
-    access_key: str
-    secret_key: str
-    source_file: str
-    line_hint: int = 0
+    __slots__ = ("access_key", "secret_key", "source_file", "line_hint")
 
-
-@dataclass
-class HitSummary:
-    kind: str
-    masked: str
-    source_file: str
-    details: dict[str, Any] = field(default_factory=dict)
+    def __init__(
+        self,
+        access_key: str,
+        secret_key: str,
+        source_file: str,
+        line_hint: int = 0,
+    ) -> None:
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.source_file = source_file
+        self.line_hint = line_hint
 
 
 def _mask_secret(s: str, keep_start: int = 4, keep_end: int = 4) -> str:
@@ -90,8 +89,7 @@ def _mask_secret(s: str, keep_start: int = 4, keep_end: int = 4) -> str:
 
 
 def _dedupe_key(parts: Iterable[str]) -> str:
-    h = hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
-    return h
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
 
 
 def pick_folder_gui() -> Path | None:
@@ -99,12 +97,12 @@ def pick_folder_gui() -> Path | None:
         import tkinter as tk
         from tkinter import filedialog
     except ImportError:
-        print("tkinter indisponible : utilisez --folder /chemin", file=sys.stderr)
+        print("no tkinter", file=sys.stderr)
         return None
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    path = filedialog.askdirectory(title="Choisir le dossier à analyser")
+    path = filedialog.askdirectory()
     root.destroy()
     if not path:
         return None
@@ -259,11 +257,11 @@ def send_telegram_hit(message: str, parse_mode: str | None = None) -> bool:
     return False
 
 
-def format_hit_banner(kind: str, status: str, masked: str, extra: str = "") -> str:
-    line = f"[HIT] [{kind}] - {status}\nCredential: {masked}"
+def hit_line(kind: str, ok: bool, masked: str, extra: str = "") -> str:
+    s = f"{kind}\t{'OK' if ok else 'FAIL'}\t{masked}"
     if extra:
-        line += f"\n{extra}"
-    return line
+        s += f"\t{extra.replace(chr(10), ' ')}"
+    return s
 
 
 def verify_sendgrid(api_key: str) -> tuple[bool, str]:
@@ -272,11 +270,11 @@ def verify_sendgrid(api_key: str) -> tuple[bool, str]:
         headers={"Authorization": f"Bearer {api_key}"},
     )
     if code == 200 and isinstance(data, dict):
-        remain = data.get("remain")
-        total = data.get("total")
-        over = data.get("overage")
-        return True, f"quota: remain={remain} total={total} overage={over}"
-    return False, f"HTTP {code}: {data!s}"[:500]
+        return True, json.dumps(
+            {k: data.get(k) for k in ("remain", "total", "overage")},
+            separators=(",", ":"),
+        )
+    return False, str(data)[:200]
 
 
 def verify_brevo(api_key: str) -> tuple[bool, str]:
@@ -285,11 +283,11 @@ def verify_brevo(api_key: str) -> tuple[bool, str]:
         headers={"api-key": api_key, "accept": "application/json"},
     )
     if code == 200 and isinstance(data, dict):
-        email = data.get("email")
-        plan = data.get("plan")
-        credits = data.get("credits")
-        return True, f"compte: email={email} plan={plan} credits={credits}"
-    return False, f"HTTP {code}: {data!s}"[:500]
+        return True, json.dumps(
+            {k: data.get(k) for k in ("email", "plan", "credits")},
+            separators=(",", ":"),
+        )
+    return False, str(data)[:200]
 
 
 def verify_aws_pair(pair: AwsPair) -> tuple[bool, str, list[tuple[str, str]]]:
@@ -297,7 +295,7 @@ def verify_aws_pair(pair: AwsPair) -> tuple[bool, str, list[tuple[str, str]]]:
         import boto3
         from botocore.exceptions import ClientError
     except ImportError:
-        return False, "boto3 non installé (pip install boto3)", []
+        return False, "no boto3", []
 
     session = boto3.Session(
         aws_access_key_id=pair.access_key,
@@ -317,18 +315,24 @@ def verify_aws_pair(pair: AwsPair) -> tuple[bool, str, list[tuple[str, str]]]:
         try:
             ses = session.client("ses", region_name=region)
             q = ses.get_send_quota()
-            max_24 = q.get("Max24HourSend")
-            sent = q.get("SentLast24Hours")
             per_region.append(
-                (region, f"Max24h={max_24} sent24h={sent}"),
+                (
+                    region,
+                    json.dumps(
+                        {
+                            "m24": q.get("Max24HourSend"),
+                            "s24": q.get("SentLast24Hours"),
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
             )
         except ClientError:
             continue
         except Exception:
             continue
 
-    detail = f"ARN={arn} Account={aid} | SES vérifié sur {len(per_region)} région(s)"
-    return True, detail, per_region
+    return True, json.dumps({"arn": arn, "acct": aid, "n": len(per_region)}, separators=(",", ":")), per_region
 
 
 def verify_smtp(
@@ -352,13 +356,13 @@ def verify_smtp(
         server.login(user, password)
         if test_recipient:
             msg = EmailMessage()
-            msg["Subject"] = "Credential scanner test"
+            msg["Subject"] = "."
             msg["From"] = user if "@" in user else f"noreply@{host}"
             msg["To"] = test_recipient
-            msg.set_content("Test SMTP depuis credential_folder_scanner (audit autorisé).")
+            msg.set_content(".")
             server.send_message(msg)
         server.quit()
-        return True, "login OK" + (" + envoi test" if test_recipient else "")
+        return True, "ok" + ("+mail" if test_recipient else "")
     except Exception as e:
         return False, str(e)
 
@@ -391,45 +395,32 @@ def run_verify(
     bundle: dict[str, Any],
     smtp_test_to: str | None,
     telegram_on_smtp: bool,
-) -> list[HitSummary]:
-    hits: list[HitSummary] = []
-
+) -> None:
     for pair in bundle["aws"]:
-        masked = f"{pair.access_key} / {_mask_secret(pair.secret_key)}"
+        masked = f"{pair.access_key}/{_mask_secret(pair.secret_key)}"
         ok, msg, regions = verify_aws_pair(pair)
-        extra_lines = [msg]
+        parts = [msg]
         for r, q in regions[:15]:
-            extra_lines.append(f"  {r}: {q}")
+            parts.append(f"{r}:{q}")
         if len(regions) > 15:
-            extra_lines.append(f"  ... +{len(regions) - 15} region(s)")
-        extra = "\n".join(extra_lines)
-        status = "FONCTIONNEL" if ok else "ÉCHEC"
-        print(format_hit_banner("AWS", status, masked, extra))
-        hits.append(
-            HitSummary(
-                "AWS",
-                masked,
-                pair.source_file,
-                {"ok": ok, "message": msg, "regions": regions},
-            ),
-        )
+            parts.append(f"+{len(regions) - 15}")
+        line = hit_line("AWS", ok, masked, " ".join(parts))
+        print(line)
 
     for key, src in bundle["sendgrid"]:
         masked = _mask_secret(key, 6, 6)
         ok, detail = verify_sendgrid(key)
-        status = "FONCTIONNEL" if ok else "ÉCHEC"
-        print(format_hit_banner("SendGrid", status, masked, detail))
-        hits.append(HitSummary("SendGrid", masked, src, {"ok": ok, "detail": detail}))
+        line = hit_line("SendGrid", ok, masked, detail)
+        print(line)
 
     for key, src in bundle["brevo"]:
         masked = _mask_secret(key, 8, 8)
         ok, detail = verify_brevo(key)
-        status = "FONCTIONNEL" if ok else "ÉCHEC"
-        print(format_hit_banner("Brevo", status, masked, detail))
-        hits.append(HitSummary("Brevo", masked, src, {"ok": ok, "detail": detail}))
+        line = hit_line("Brevo", ok, masked, detail)
+        print(line)
 
     for s in bundle["smtp"]:
-        masked = f"{s['user']} @ {s['host']}:{s['port']}"
+        masked = f"{s['user']}@{s['host']}:{s['port']}"
         use_tls = s["port"] in (587, 2525)
         ok, detail = verify_smtp(
             s["host"],
@@ -439,42 +430,38 @@ def run_verify(
             use_tls,
             smtp_test_to,
         )
-        status = "FONCTIONNEL" if ok else "ÉCHEC"
-        banner = format_hit_banner("SMTP", status, masked, f"{s['file']}\n{detail}")
-        print(banner)
-        hits.append(HitSummary("SMTP", masked, s["file"], {"ok": ok, "detail": detail}))
+        line = hit_line("SMTP", ok, masked, f"{s['file']} {detail}")
+        print(line)
         if ok and telegram_on_smtp:
-            send_telegram_hit(banner)
-
-    return hits
+            send_telegram_hit(line)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--folder", type=Path)
-    parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--smtp-test-to", type=str, default=None)
-    parser.add_argument("--telegram-smtp-hit", action="store_true")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--folder", type=Path)
+    p.add_argument("--verify", action="store_true")
+    p.add_argument("--smtp-test-to", type=str, default=None)
+    p.add_argument("--telegram-smtp-hit", action="store_true")
+    args = p.parse_args()
 
     root = args.folder
     if root is None:
         root = pick_folder_gui()
     if root is None or not root.is_dir():
-        print("Dossier invalide ou non choisi.", file=sys.stderr)
+        print("no folder", file=sys.stderr)
         return 2
 
-    print(f"Scan de : {root.resolve()}")
     bundle = scan_folder(root)
     print(
         json.dumps(
             {
-                "aws_pairs": len(bundle["aws"]),
+                "root": str(root.resolve()),
+                "aws": len(bundle["aws"]),
                 "sendgrid": len(bundle["sendgrid"]),
                 "brevo": len(bundle["brevo"]),
                 "smtp": len(bundle["smtp"]),
             },
-            indent=2,
+            separators=(",", ":"),
         ),
     )
 
