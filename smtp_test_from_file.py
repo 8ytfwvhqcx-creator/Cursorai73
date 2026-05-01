@@ -80,21 +80,62 @@ def send_test_mail(cfg: dict, to_addr: str, dry_run: bool) -> None:
     print(f"OK envoyé depuis {cfg['email']} ({host}:{port}) vers {to_addr}")
 
 
+def _resolve_fichier_et_destinataire(
+    positionnels: list[str],
+) -> tuple[Path, str | None]:
+    """
+    Accepte :
+      fichier
+      fichier email
+      email fichier
+    Retourne (Path fichier, email destinataire ou None si à demander / --to).
+    """
+    n = len(positionnels)
+    if n == 0:
+        raise ValueError("Indiquez le fichier des comptes SMTP (et optionnellement l'e-mail du destinataire).")
+    if n == 1:
+        return Path(positionnels[0]), None
+    if n == 2:
+        a, b = positionnels[0], positionnels[1]
+        a_mail = "@" in a
+        b_mail = "@" in b
+        pa, pb = Path(a), Path(b)
+        if a_mail and not b_mail:
+            return pb, a.strip()
+        if b_mail and not a_mail:
+            return pa, b.strip()
+        if pa.is_file() and not pb.is_file():
+            return pa, b.strip() if b_mail else None
+        if pb.is_file() and not pa.is_file():
+            return pb, a.strip() if a_mail else None
+        if pa.is_file() and b_mail:
+            return pa, b.strip()
+        if pb.is_file() and a_mail:
+            return pb, a.strip()
+        raise ValueError(
+            "Deux arguments : précisez le fichier et l'e-mail du destinataire "
+            "(ordre libre : fichier puis e-mail, ou e-mail puis fichier)."
+        )
+    raise ValueError("Trop d'arguments positionnels ; attendu : fichier [e-mail] ou e-mail fichier.")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Teste des entrées SMTP depuis un fichier et envoie un mail de test."
+        description="Teste des entrées SMTP depuis un fichier et envoie un mail de test.",
+        epilog="Exemples : %(prog)s comptes.txt --to moi@exemple.fr | %(prog)s moi@exemple.fr comptes.txt | %(prog)s comptes.txt moi@exemple.fr",
     )
     p.add_argument(
-        "fichier",
-        type=Path,
-        help="Fichier texte (une ligne par compte au format EMAIL:, HOST:, ...)",
+        "positionnels",
+        nargs="*",
+        metavar="fichier|email",
+        help="Fichier des comptes ; avec un 2e argument : e-mail destinataire (ordre libre avec le fichier).",
     )
     p.add_argument(
         "--to",
         "-t",
         dest="to_addr",
         metavar="EMAIL",
-        help="Adresse du destinataire du mail de test (sinon demandé interactivement)",
+        help="Destinataire du test (prioritaire sur l'e-mail en argument positionnel)",
     )
     p.add_argument(
         "--dry-run",
@@ -103,18 +144,25 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if not args.fichier.is_file():
-        print(f"Erreur : fichier introuvable : {args.fichier}", file=sys.stderr)
+    try:
+        fichier, to_pos = _resolve_fichier_et_destinataire(args.positionnels)
+    except ValueError as e:
+        print(f"Erreur : {e}", file=sys.stderr)
+        p.print_usage(file=sys.stderr)
         return 1
 
-    to_addr = args.to_addr
+    if not fichier.is_file():
+        print(f"Erreur : fichier introuvable : {fichier}", file=sys.stderr)
+        return 1
+
+    to_addr = args.to_addr or to_pos
     if not to_addr:
         to_addr = input("Adresse e-mail du destinataire du test : ").strip()
     if not to_addr:
         print("Erreur : destinataire vide.", file=sys.stderr)
         return 1
 
-    text = args.fichier.read_text(encoding="utf-8", errors="replace")
+    text = fichier.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     configs: list[dict] = []
     bad_lines: list[tuple[int, str]] = []
