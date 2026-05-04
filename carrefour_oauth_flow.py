@@ -35,6 +35,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -1046,6 +1047,11 @@ if __name__ == "__main__":
         solver = _solver_key_interactive()
         out = run_full_flow(env_proxy, env_user, env_pass, solver_client_key=solver)
         print(json.dumps(out, indent=2, ensure_ascii=False))
+        if env_threads > 1:
+            print(
+                f"(Note: THREAD_COUNT={env_threads} n’affecte que le mode combolist.)",
+                file=sys.stderr,
+            )
     elif env_user and env_pass and not env_proxy:
         print(
             "CARREFOUR_USER et CARREFOUR_PASS sont définis mais POST_PROXY_URL est vide ; "
