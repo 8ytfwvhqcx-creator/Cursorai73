@@ -227,9 +227,9 @@ def post_login(
 ) -> requests.Response:
     us = urllib.parse.quote(email, safe="")
     body = (
-        f"captchaToken={urllib.parse.quote(captcha_token, safe='')}"
+        f"captchaToken={urllib.parse.quote(captcha_token)}"
         f"&email={us}"
-        f"&password={urllib.parse.quote(password, safe='')}"
+        f"&password={urllib.parse.quote(password)}"
         f"&opendata={OPENDATA_ENCODED}"
     )
     headers = login_headers(proxy_url)
@@ -259,7 +259,7 @@ def extract_session_token(text: str) -> str | None:
 
 
 def get_balance_page(sess: requests.Session, token: str, proxy_url: str) -> str:
-    cookie = GET_COOKIE_TEMPLATE.format(token=urllib.parse.quote(token, safe=""))
+    cookie = GET_COOKIE_TEMPLATE.format(token=token)
     headers = {
         "accept": (
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
