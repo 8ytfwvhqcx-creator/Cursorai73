@@ -18,9 +18,10 @@ from urllib.parse import parse_qs
 # CONFIG
 # =========================================================
 
-CONSUMER_KEY = "als57b6d9bfbd8041.16892809"
-# Capture Reqable (getToken OK) : als57b6d9b235e084.77233595 — la paire doit
-# correspondre à CONSUMER_SECRET ; si getToken reste "ko", essayez cette clé.
+CONSUMER_KEY = "als57b6d9b235e084.77233595"
+# Même clé que Reqable pour requestToken + login + getToken.
+# CONSUMER_SECRET doit être celui associé à cette clé dans l’app mobile.
+# Ancienne clé possible (autre build) : als57b6d9bfbd8041.16892809
 CONSUMER_SECRET = "TON_CONSUMER_SECRET"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
@@ -157,15 +158,20 @@ COMMON_HEADERS = {
     "Referer": "https://mobile.poulpeo.com/",
 }
 
+GET_TOKEN_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+)
+
+# Reqable : uniquement ces en-têtes (pas Connection / Origin / Referer)
 GET_TOKEN_HEADERS = {
-    "Accept": "application/json",
-    "X-CLIENT-VERSION": "26.1.5",
-    "Accept-Charset": "UTF-8",
-    "Accept-Encoding": "deflate;q=1.0,gzip;q=0.9",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "User-Agent": COMMON_HEADERS["User-Agent"],
-    "Connection": "keep-alive",
-    "Priority": "u=3, i",
+    "accept": "application/json",
+    "x-client-version": "26.1.5",
+    "accept-charset": "UTF-8",
+    "accept-encoding": "deflate;q=1.0,gzip;q=0.9",
+    "accept-language": "fr-FR,fr;q=0.9",
+    "user-agent": GET_TOKEN_UA,
+    "priority": "u=3, i",
 }
 
 # =========================================================
@@ -181,6 +187,7 @@ def build_oauth_header(
     token=None,
     token_secret="",
     extra_params=None,
+    authorization_key_order=None,
 ):
 
     oauth_params = {
@@ -240,9 +247,23 @@ def build_oauth_header(
 
     oauth_params["oauth_signature"] = signature
 
+    if authorization_key_order:
+        ordered = []
+        seen = set()
+        for key in authorization_key_order:
+            if key in oauth_params:
+                ordered.append((key, oauth_params[key]))
+                seen.add(key)
+        for key, val in oauth_params.items():
+            if key not in seen:
+                ordered.append((key, val))
+        items = ordered
+    else:
+        items = list(oauth_params.items())
+
     auth_header = "OAuth " + ", ".join([
-        f'{k}="{urllib.parse.quote(str(v))}"'
-        for k, v in oauth_params.items()
+        f'{k}="{urllib.parse.quote(str(v), safe="")}"'
+        for k, v in items
     ])
 
     return auth_header
@@ -327,39 +348,38 @@ def _parse_get_token_payload(raw):
     return status, jwt
 
 
+_REQABLE_GET_TOKEN_AUTH_ORDER = (
+    "oauth_consumer_key",
+    "oauth_nonce",
+    "oauth_signature",
+    "oauth_signature_method",
+    "oauth_timestamp",
+    "oauth_token",
+    "oauth_version",
+)
+
+
 def fetch_get_token_jwt(session, oauth_token, oauth_token_secret):
-    strategies = (
-        (None, "sans realm dans la signature (comme Reqable)"),
-        ({"realm": GET_TOKEN_URL}, "avec realm=URL dans la signature"),
+    auth_header = build_oauth_header(
+        method="GET",
+        url=GET_TOKEN_URL,
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        token=oauth_token,
+        token_secret=oauth_token_secret,
+        extra_params=None,
+        authorization_key_order=_REQABLE_GET_TOKEN_AUTH_ORDER,
     )
+    headers = GET_TOKEN_HEADERS.copy()
+    headers["authorization"] = auth_header
 
-    last_status, last_raw = 0, ""
+    response = session.get(GET_TOKEN_URL, headers=headers)
+    raw = response.text or ""
 
-    for extra_params, _ in strategies:
-        auth_header = build_oauth_header(
-            method="GET",
-            url=GET_TOKEN_URL,
-            consumer_key=CONSUMER_KEY,
-            consumer_secret=CONSUMER_SECRET,
-            token=oauth_token,
-            token_secret=oauth_token_secret,
-            extra_params=extra_params,
-        )
-        headers = GET_TOKEN_HEADERS.copy()
-        headers["Authorization"] = auth_header
-
-        response = session.get(GET_TOKEN_URL, headers=headers)
-        raw = response.text or ""
-        last_status, last_raw = response.status_code, raw
-
-        status, jwt = _parse_get_token_payload(raw)
-        if jwt:
-            return jwt, response.status_code, raw
-        if status == "ko" and extra_params is None:
-            continue
-        break
-
-    return None, last_status, last_raw
+    status, jwt = _parse_get_token_payload(raw)
+    if jwt:
+        return jwt, response.status_code, raw
+    return None, response.status_code, raw
 
 
 def fetch_request_token(session):
