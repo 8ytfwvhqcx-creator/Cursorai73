@@ -40,6 +40,8 @@ LABEL:UA
   => VAR @UA
 ENDBLOCK
 
+SET USEPROXY TRUE
+
 BLOCK:Script
 INTERPRETER:NodeJS
 INPUT CK, CS, RT_URL
@@ -107,7 +109,7 @@ LABEL:RT
   autoRedirect = True
   httpLibrary = SystemNet
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<rtAuth>")}
-  httpVersion = "1.1"
+  httpVersion = "2.0"
   TYPE:STANDARD
   $"<rtBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
@@ -115,6 +117,9 @@ ENDBLOCK
 
 BLOCK:Keycheck
   banIfNoMatch = False
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.SOURCE Contains "Cloudflare"
+    STRINGKEY @data.SOURCE Contains "Sorry, you have been blocked"
   KEYCHAIN FAIL OR
     STRINGKEY @data.RESPONSECODE DoesNotContain "200"
 ENDBLOCK
@@ -219,7 +224,7 @@ LABEL:LOGIN
   autoRedirect = True
   httpLibrary = SystemNet
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<loginAuth>")}
-  httpVersion = "1.1"
+  httpVersion = "2.0"
   TYPE:STANDARD
   $"<loginBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
@@ -301,7 +306,7 @@ LABEL:AT
   autoRedirect = True
   httpLibrary = SystemNet
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<atAuth>")}
-  httpVersion = "1.1"
+  httpVersion = "2.0"
   TYPE:STANDARD
   $"<atBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
@@ -392,7 +397,7 @@ LABEL:GT
   autoRedirect = True
   httpLibrary = SystemNet
   customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", "<UA>"), ("priority", "u=3, i"), ("Authorization", "<gtAuth>")}
-  httpVersion = "1.1"
+  httpVersion = "2.0"
   TYPE:STANDARD
   $""
   $""
