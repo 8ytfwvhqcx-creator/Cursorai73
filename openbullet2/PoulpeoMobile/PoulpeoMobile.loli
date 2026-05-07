@@ -1,0 +1,411 @@
+BLOCK:ConstantString
+LABEL:CK
+  value = "als57b6d9b235e084.77233595"
+  => VAR @CK
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:CS
+  value = "84dbb79eddc1effe14965db52caeae70636ac31b"
+  => VAR @CS
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:RT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/oauth/requestToken/"
+  => VAR @RT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:LOGIN_URL
+  value = "https://mobile.poulpeo.com/api/2.2/user/login/"
+  => VAR @LOGIN_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:AT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/oauth/accessToken/"
+  => VAR @AT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:GT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/user/getToken/"
+  => VAR @GT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:UA
+  value = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+  => VAR @UA
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, RT_URL
+BEGIN SCRIPT
+const crypto = require('crypto');
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var realm = String(RT_URL);
+var extra = { realm: realm };
+var u = new URLSearchParams();
+u.set('realm', realm);
+var rtBody = u.toString();
+var rtAuth = buildOAuthHeader('POST', String(RT_URL), String(CK), String(CS), '', '', extra);
+END SCRIPT
+OUTPUT String @rtAuth
+OUTPUT String @rtBody
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:RT
+  url = "<RT_URL>"
+  method = POST
+  autoRedirect = True
+  httpLibrary = SystemNet
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<rtAuth>")}
+  httpVersion = "1.1"
+  TYPE:STANDARD
+  "<rtBody>"
+  "application/x-www-form-urlencoded; charset=UTF-8"
+ENDBLOCK
+
+BLOCK:Keycheck
+  banIfNoMatch = False
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:oauth_token
+  input = @data.SOURCE
+  leftDelim = "oauth_token="
+  rightDelim = "&"
+  MODE:LR
+  => VAR @oauth_token
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:oauth_token_secret
+  input = @data.SOURCE
+  leftDelim = "oauth_token_secret="
+  rightDelim = ""
+  MODE:LR
+  => VAR @oauth_token_secret
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, input.USER, input.PASS
+BEGIN SCRIPT
+const crypto = require('crypto');
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var realm = String(LOGIN_URL);
+var opendata = {
+  client_id: 'als52f20495d05ac2.56394549',
+  application: { advertiser_id: crypto.randomUUID().toUpperCase(), version: '26.1.5' },
+  version: '2.0',
+  fp: crypto.randomUUID().toUpperCase(),
+  viewport: 'smartphone'
+};
+var opendataJson = JSON.stringify(opendata);
+var extra = { email: String(USER), password: String(PASS), realm: realm, opendata: opendataJson };
+var ub = new URLSearchParams();
+ub.set('email', String(USER));
+ub.set('password', String(PASS));
+ub.set('realm', realm);
+ub.set('opendata', opendataJson);
+var loginBody = ub.toString();
+var loginAuth = buildOAuthHeader('POST', String(LOGIN_URL), String(CK), String(CS), String(oauth_token), String(oauth_token_secret), extra);
+END SCRIPT
+OUTPUT String @loginAuth
+OUTPUT String @loginBody
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:LOGIN
+  url = "<LOGIN_URL>"
+  method = POST
+  autoRedirect = True
+  httpLibrary = SystemNet
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<loginAuth>")}
+  httpVersion = "1.1"
+  TYPE:STANDARD
+  "<loginBody>"
+  "application/x-www-form-urlencoded; charset=UTF-8"
+ENDBLOCK
+
+BLOCK:Keycheck
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @data.SOURCE Contains "\"status\":\"ok\""
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.SOURCE Contains "Email, pseudo ou mot de passe invalide"
+  KEYCHAIN RETRY OR
+    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, AT_URL, oauth_token, oauth_token_secret
+BEGIN SCRIPT
+const crypto = require('crypto');
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var realm = String(AT_URL);
+var extra = { realm: realm };
+var ua = new URLSearchParams();
+ua.set('realm', realm);
+var atBody = ua.toString();
+var atAuth = buildOAuthHeader('POST', String(AT_URL), String(CK), String(CS), String(oauth_token), String(oauth_token_secret), extra);
+END SCRIPT
+OUTPUT String @atAuth
+OUTPUT String @atBody
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:AT
+  url = "<AT_URL>"
+  method = POST
+  autoRedirect = True
+  httpLibrary = SystemNet
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<atAuth>")}
+  httpVersion = "1.1"
+  TYPE:STANDARD
+  "<atBody>"
+  "application/x-www-form-urlencoded; charset=UTF-8"
+ENDBLOCK
+
+BLOCK:Keycheck
+  banIfNoMatch = False
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:access_token
+  input = @data.SOURCE
+  leftDelim = "oauth_token="
+  rightDelim = "&"
+  MODE:LR
+  => VAR @access_token
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:access_token_secret
+  input = @data.SOURCE
+  leftDelim = "oauth_token_secret="
+  rightDelim = ""
+  MODE:LR
+  => VAR @access_token_secret
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, GT_URL, access_token, access_token_secret
+BEGIN SCRIPT
+const crypto = require('crypto');
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var gtAuth = buildOAuthHeader('GET', String(GT_URL), String(CK), String(CS), String(access_token), String(access_token_secret), {});
+END SCRIPT
+OUTPUT String @gtAuth
+ENDBLOCK
+
+BLOCK:HttpRequest
+LABEL:GT
+  url = "<GT_URL>"
+  method = GET
+  autoRedirect = True
+  httpLibrary = SystemNet
+  customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", "<UA>"), ("priority", "u=3, i"), ("Authorization", "<gtAuth>")}
+  httpVersion = "1.1"
+  TYPE:STANDARD
+  $""
+  $""
+ENDBLOCK
+
+BLOCK:Keycheck
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @data.SOURCE Contains "\"status\":\"ok\""
+  KEYCHAIN FAIL OR
+    STRINGKEY @data.RESPONSECODE DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:JWT
+  input = @data.SOURCE
+  leftDelim = "\"data\":\""
+  rightDelim = "\""
+  MODE:LR
+  => CAP @JWT
+ENDBLOCK
