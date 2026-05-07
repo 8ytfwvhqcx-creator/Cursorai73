@@ -118,7 +118,7 @@ ENDBLOCK
 
 BLOCK:Keycheck
   banIfNoMatch = False
-  KEYCHAIN RETRY OR
+  KEYCHAIN FAIL OR
     STRINGKEY @data.SOURCE Contains "Cloudflare"
     STRINGKEY @data.SOURCE Contains "Sorry, you have been blocked"
   KEYCHAIN FAIL OR
