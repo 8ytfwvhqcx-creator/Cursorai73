@@ -156,7 +156,7 @@ BLOCK:Keycheck
     STRINGKEY @RT_RESPONSE Contains "Cloudflare"
     STRINGKEY @RT_RESPONSE Contains "Sorry, you have been blocked"
   KEYCHAIN FAIL OR
-    STRINGKEY @RT_STATUS DoesNotEqual "200"
+    STRINGKEY @RT_STATUS DoesNotContain "200"
 ENDBLOCK
 
 BLOCK:Parse
@@ -308,7 +308,7 @@ BLOCK:Keycheck
   KEYCHAIN FAIL OR
     STRINGKEY @LOGIN_RESPONSE Contains "Email, pseudo ou mot de passe invalide"
   KEYCHAIN RETRY OR
-    STRINGKEY @LOGIN_STATUS DoesNotEqual "200"
+    STRINGKEY @LOGIN_STATUS DoesNotContain "200"
 ENDBLOCK
 
 BLOCK:Script
@@ -422,7 +422,7 @@ ENDBLOCK
 BLOCK:Keycheck
   banIfNoMatch = False
   KEYCHAIN FAIL OR
-    STRINGKEY @AT_STATUS DoesNotEqual "200"
+    STRINGKEY @AT_STATUS DoesNotContain "200"
 ENDBLOCK
 
 BLOCK:Parse
@@ -546,7 +546,7 @@ BLOCK:Keycheck
   KEYCHAIN SUCCESS OR
     STRINGKEY @GT_RESPONSE Contains "\"status\":\"ok\""
   KEYCHAIN FAIL OR
-    STRINGKEY @GT_STATUS DoesNotEqual "200"
+    STRINGKEY @GT_STATUS DoesNotContain "200"
 ENDBLOCK
 
 BLOCK:Parse
