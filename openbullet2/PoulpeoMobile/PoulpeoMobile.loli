@@ -139,7 +139,7 @@ ENDBLOCK
 
 BLOCK:Script
 INTERPRETER:NodeJS
-INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, USER, PASS
+INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, USERNAME, PASSWORD
 BEGIN SCRIPT
 const crypto = require('crypto');
 function percentEncode(str) {
@@ -195,10 +195,10 @@ var opendata = {
   viewport: 'smartphone'
 };
 var opendataJson = JSON.stringify(opendata);
-var extra = { email: String(USER), password: String(PASS), realm: realm, opendata: opendataJson };
+var extra = { email: String(USERNAME), password: String(PASSWORD), realm: realm, opendata: opendataJson };
 var ub = new URLSearchParams();
-ub.set('email', String(USER));
-ub.set('password', String(PASS));
+ub.set('email', String(USERNAME));
+ub.set('password', String(PASSWORD));
 ub.set('realm', realm);
 ub.set('opendata', opendataJson);
 var loginBody = ub.toString();
