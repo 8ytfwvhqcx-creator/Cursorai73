@@ -139,7 +139,7 @@ ENDBLOCK
 
 BLOCK:Script
 INTERPRETER:NodeJS
-INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, USERNAME, PASSWORD
+INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, input.DATA
 BEGIN SCRIPT
 const crypto = require('crypto');
 function percentEncode(str) {
@@ -186,6 +186,10 @@ function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, token
   parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
   return 'OAuth ' + parts.join(', ');
 }
+var combo = String(DATA).trim();
+var ci = combo.indexOf(':');
+var email = ci >= 0 ? combo.substring(0, ci) : combo;
+var password = ci >= 0 ? combo.substring(ci + 1) : '';
 var realm = String(LOGIN_URL);
 var opendata = {
   client_id: 'als52f20495d05ac2.56394549',
@@ -195,10 +199,10 @@ var opendata = {
   viewport: 'smartphone'
 };
 var opendataJson = JSON.stringify(opendata);
-var extra = { email: String(USERNAME), password: String(PASSWORD), realm: realm, opendata: opendataJson };
+var extra = { email: email, password: password, realm: realm, opendata: opendataJson };
 var ub = new URLSearchParams();
-ub.set('email', String(USERNAME));
-ub.set('password', String(PASSWORD));
+ub.set('email', email);
+ub.set('password', password);
 ub.set('realm', realm);
 ub.set('opendata', opendataJson);
 var loginBody = ub.toString();
