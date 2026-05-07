@@ -42,6 +42,20 @@ ENDBLOCK
 
 SET USEPROXY TRUE
 
+BLOCK:HttpRequest
+LABEL:WARMUP
+  url = "https://mobile.poulpeo.com/"
+  method = GET
+  autoRedirect = True
+  httpLibrary = RuriLibHttp
+  securityProtocol = TLS12
+  customHeaders = ${("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("User-Agent", "<UA>"), ("Accept-Encoding", "gzip, deflate, br"), ("Upgrade-Insecure-Requests", "1")}
+  httpVersion = "1.1"
+  TYPE:STANDARD
+  $""
+  $""
+ENDBLOCK
+
 BLOCK:Script
 INTERPRETER:NodeJS
 INPUT CK, CS, RT_URL
@@ -108,7 +122,8 @@ LABEL:RT
   url = $"<RT_URL>"
   method = POST
   autoRedirect = True
-  httpLibrary = SystemNet
+  httpLibrary = RuriLibHttp
+  securityProtocol = TLS12
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<rtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
@@ -226,7 +241,8 @@ LABEL:LOGIN
   url = $"<LOGIN_URL>"
   method = POST
   autoRedirect = True
-  httpLibrary = SystemNet
+  httpLibrary = RuriLibHttp
+  securityProtocol = TLS12
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<loginAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
@@ -309,7 +325,8 @@ LABEL:AT
   url = $"<AT_URL>"
   method = POST
   autoRedirect = True
-  httpLibrary = SystemNet
+  httpLibrary = RuriLibHttp
+  securityProtocol = TLS12
   customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<atAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
@@ -403,7 +420,8 @@ LABEL:GT
   url = $"<GT_URL>"
   method = GET
   autoRedirect = True
-  httpLibrary = SystemNet
+  httpLibrary = RuriLibHttp
+  securityProtocol = TLS12
   customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", "<UA>"), ("priority", "u=3, i"), ("Authorization", "<gtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
