@@ -3,6 +3,7 @@ Flux mobile Poulpeo (OAuth 1.0a) : requestToken → login → accessToken → ge
 Les appels Braze / Firebase du HAR ne sont pas requis pour récupérer le JWT.
 """
 import json
+import re
 import threading
 import time
 import uuid
