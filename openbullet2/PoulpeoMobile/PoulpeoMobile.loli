@@ -106,7 +106,7 @@ LABEL:RT
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<rtAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<rtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
   $"<rtBody>"
@@ -214,7 +214,7 @@ LABEL:LOGIN
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<loginAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<loginAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
   $"<loginBody>"
@@ -296,7 +296,7 @@ LABEL:AT
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<atAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<atAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
   $"<atBody>"
@@ -387,7 +387,7 @@ LABEL:GT
   method = GET
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", $"<UA>"), ("priority", "u=3, i"), ("Authorization", $"<gtAuth>")}
+  customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", "<UA>"), ("priority", "u=3, i"), ("Authorization", "<gtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
   $""
