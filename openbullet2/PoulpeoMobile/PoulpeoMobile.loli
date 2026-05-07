@@ -102,14 +102,14 @@ ENDBLOCK
 
 BLOCK:HttpRequest
 LABEL:RT
-  url = "<RT_URL>"
+  url = $"<RT_URL>"
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<rtAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<rtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
-  "<rtBody>"
+  $"<rtBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
 ENDBLOCK
 
@@ -139,7 +139,7 @@ ENDBLOCK
 
 BLOCK:Script
 INTERPRETER:NodeJS
-INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, input.USER, input.PASS
+INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, USER, PASS
 BEGIN SCRIPT
 const crypto = require('crypto');
 function percentEncode(str) {
@@ -210,14 +210,14 @@ ENDBLOCK
 
 BLOCK:HttpRequest
 LABEL:LOGIN
-  url = "<LOGIN_URL>"
+  url = $"<LOGIN_URL>"
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<loginAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<loginAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
-  "<loginBody>"
+  $"<loginBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
 ENDBLOCK
 
@@ -292,14 +292,14 @@ ENDBLOCK
 
 BLOCK:HttpRequest
 LABEL:AT
-  url = "<AT_URL>"
+  url = $"<AT_URL>"
   method = POST
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", "<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", "<atAuth>")}
+  customHeaders = ${("Accept", "application/json"), ("Accept-Charset", "UTF-8"), ("Accept-Encoding", "gzip, deflate, br"), ("Accept-Language", "fr-FR,fr;q=0.9"), ("Connection", "keep-alive"), ("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"), ("User-Agent", $"<UA>"), ("X-CLIENT-VERSION", "26.1.5"), ("Origin", "https://mobile.poulpeo.com"), ("Referer", "https://mobile.poulpeo.com/"), ("Authorization", $"<atAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
-  "<atBody>"
+  $"<atBody>"
   "application/x-www-form-urlencoded; charset=UTF-8"
 ENDBLOCK
 
@@ -383,11 +383,11 @@ ENDBLOCK
 
 BLOCK:HttpRequest
 LABEL:GT
-  url = "<GT_URL>"
+  url = $"<GT_URL>"
   method = GET
   autoRedirect = True
   httpLibrary = SystemNet
-  customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", "<UA>"), ("priority", "u=3, i"), ("Authorization", "<gtAuth>")}
+  customHeaders = ${("accept", "application/json"), ("x-client-version", "26.1.5"), ("accept-charset", "UTF-8"), ("accept-encoding", "deflate;q=1.0,gzip;q=0.9"), ("accept-language", "fr-FR,fr;q=0.9"), ("user-agent", $"<UA>"), ("priority", "u=3, i"), ("Authorization", $"<gtAuth>")}
   httpVersion = "1.1"
   TYPE:STANDARD
   $""
