@@ -1,0 +1,563 @@
+BLOCK:ConstantString
+LABEL:CK
+  value = "als57b6d9b235e084.77233595"
+  => VAR @CK
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:CS
+  value = "84dbb79eddc1effe14965db52caeae70636ac31b"
+  => VAR @CS
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:RT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/oauth/requestToken/"
+  => VAR @RT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:LOGIN_URL
+  value = "https://mobile.poulpeo.com/api/2.2/user/login/"
+  => VAR @LOGIN_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:AT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/oauth/accessToken/"
+  => VAR @AT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:GT_URL
+  value = "https://mobile.poulpeo.com/api/2.2/user/getToken/"
+  => VAR @GT_URL
+ENDBLOCK
+
+BLOCK:ConstantString
+LABEL:UA
+  value = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+  => VAR @UA
+ENDBLOCK
+
+SET USEPROXY FALSE
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, RT_URL, UA
+BEGIN SCRIPT
+const crypto = require('crypto');
+const http = require('http');
+function bridgeExec(payload) {
+  return new Promise(function (resolve, reject) {
+    var data = JSON.stringify(payload);
+    var req = http.request({
+      hostname: '127.0.0.1',
+      port: 18765,
+      path: '/exec',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data, 'utf8') }
+    }, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        resolve({ code: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function formBodyOrdered(pairs) {
+  return pairs.map(function (p) { return percentEncode(p[0]) + '=' + percentEncode(String(p[1])); }).join('&');
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var realm = String(RT_URL);
+var extra = { realm: realm };
+var rtBody = formBodyOrdered([['realm', realm]]);
+var rtAuth = buildOAuthHeader('POST', String(RT_URL), String(CK), String(CS), '', '', extra);
+var uaStr = String(UA);
+var hdrs = {
+  'Accept': 'application/json',
+  'Accept-Charset': 'UTF-8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Accept-Language': 'fr-FR,fr;q=0.9',
+  'Connection': 'keep-alive',
+  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+  'User-Agent': uaStr,
+  'X-CLIENT-VERSION': '26.1.5',
+  'Origin': 'https://mobile.poulpeo.com',
+  'Referer': 'https://mobile.poulpeo.com/',
+  'Authorization': rtAuth
+};
+var br = await bridgeExec({ method: 'POST', url: String(RT_URL), headers: hdrs, body: rtBody });
+var RT_STATUS;
+var RT_RESPONSE;
+try {
+  var jr = JSON.parse(br.text);
+  RT_STATUS = String(jr.status != null ? jr.status : br.code);
+  RT_RESPONSE = String(jr.text != null ? jr.text : '');
+} catch (e1) {
+  RT_STATUS = String(br.code);
+  RT_RESPONSE = br.text;
+}
+END SCRIPT
+OUTPUT String @RT_STATUS
+OUTPUT String @RT_RESPONSE
+ENDBLOCK
+
+BLOCK:Keycheck
+  banIfNoMatch = False
+  KEYCHAIN FAIL OR
+    STRINGKEY @RT_RESPONSE Contains "Cloudflare"
+    STRINGKEY @RT_RESPONSE Contains "Sorry, you have been blocked"
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @RT_STATUS EqualTo "200"
+  KEYCHAIN FAIL OR
+    STRINGKEY @RT_STATUS DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:oauth_token
+  input = @RT_RESPONSE
+  leftDelim = "oauth_token="
+  rightDelim = "&"
+  MODE:LR
+  => VAR @oauth_token
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:oauth_token_secret
+  input = @RT_RESPONSE
+  leftDelim = "oauth_token_secret="
+  rightDelim = ""
+  MODE:LR
+  => VAR @oauth_token_secret
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, LOGIN_URL, oauth_token, oauth_token_secret, input.DATA, UA
+BEGIN SCRIPT
+const crypto = require('crypto');
+const http = require('http');
+function bridgeExec(payload) {
+  return new Promise(function (resolve, reject) {
+    var data = JSON.stringify(payload);
+    var req = http.request({
+      hostname: '127.0.0.1',
+      port: 18765,
+      path: '/exec',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data, 'utf8') }
+    }, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        resolve({ code: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function formBodyOrdered(pairs) {
+  return pairs.map(function (p) { return percentEncode(p[0]) + '=' + percentEncode(String(p[1])); }).join('&');
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var combo = String(DATA).trim();
+var ci = combo.indexOf(':');
+var email = ci >= 0 ? combo.substring(0, ci) : combo;
+var password = ci >= 0 ? combo.substring(ci + 1) : '';
+var realm = String(LOGIN_URL);
+var opendata = {
+  client_id: 'als52f20495d05ac2.56394549',
+  application: { advertiser_id: crypto.randomUUID().toUpperCase(), version: '26.1.5' },
+  version: '2.0',
+  fp: crypto.randomUUID().toUpperCase(),
+  viewport: 'smartphone'
+};
+var opendataJson = JSON.stringify(opendata);
+var extra = { email: email, password: password, realm: realm, opendata: opendataJson };
+var loginBody = formBodyOrdered([
+  ['email', email],
+  ['password', password],
+  ['realm', realm],
+  ['opendata', opendataJson]
+]);
+var loginAuth = buildOAuthHeader('POST', String(LOGIN_URL), String(CK), String(CS), String(oauth_token), String(oauth_token_secret), extra);
+var uaStr = String(UA);
+var hdrs = {
+  'Accept': 'application/json',
+  'Accept-Charset': 'UTF-8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Accept-Language': 'fr-FR,fr;q=0.9',
+  'Connection': 'keep-alive',
+  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+  'User-Agent': uaStr,
+  'X-CLIENT-VERSION': '26.1.5',
+  'Origin': 'https://mobile.poulpeo.com',
+  'Referer': 'https://mobile.poulpeo.com/',
+  'Authorization': loginAuth
+};
+var br = await bridgeExec({ method: 'POST', url: String(LOGIN_URL), headers: hdrs, body: loginBody });
+var LOGIN_STATUS;
+var LOGIN_RESPONSE;
+try {
+  var jr = JSON.parse(br.text);
+  LOGIN_STATUS = String(jr.status != null ? jr.status : br.code);
+  LOGIN_RESPONSE = String(jr.text != null ? jr.text : '');
+} catch (e1) {
+  LOGIN_STATUS = String(br.code);
+  LOGIN_RESPONSE = br.text;
+}
+END SCRIPT
+OUTPUT String @LOGIN_STATUS
+OUTPUT String @LOGIN_RESPONSE
+ENDBLOCK
+
+BLOCK:Keycheck
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @LOGIN_RESPONSE Contains "\"status\":\"ok\""
+  KEYCHAIN FAIL OR
+    STRINGKEY @LOGIN_RESPONSE Contains "Email, pseudo ou mot de passe invalide"
+  KEYCHAIN RETRY OR
+    STRINGKEY @LOGIN_STATUS DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, AT_URL, oauth_token, oauth_token_secret, UA
+BEGIN SCRIPT
+const crypto = require('crypto');
+const http = require('http');
+function bridgeExec(payload) {
+  return new Promise(function (resolve, reject) {
+    var data = JSON.stringify(payload);
+    var req = http.request({
+      hostname: '127.0.0.1',
+      port: 18765,
+      path: '/exec',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data, 'utf8') }
+    }, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        resolve({ code: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function formBodyOrdered(pairs) {
+  return pairs.map(function (p) { return percentEncode(p[0]) + '=' + percentEncode(String(p[1])); }).join('&');
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var realm = String(AT_URL);
+var extra = { realm: realm };
+var atBody = formBodyOrdered([['realm', realm]]);
+var atAuth = buildOAuthHeader('POST', String(AT_URL), String(CK), String(CS), String(oauth_token), String(oauth_token_secret), extra);
+var uaStr = String(UA);
+var hdrs = {
+  'Accept': 'application/json',
+  'Accept-Charset': 'UTF-8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Accept-Language': 'fr-FR,fr;q=0.9',
+  'Connection': 'keep-alive',
+  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+  'User-Agent': uaStr,
+  'X-CLIENT-VERSION': '26.1.5',
+  'Origin': 'https://mobile.poulpeo.com',
+  'Referer': 'https://mobile.poulpeo.com/',
+  'Authorization': atAuth
+};
+var br = await bridgeExec({ method: 'POST', url: String(AT_URL), headers: hdrs, body: atBody });
+var AT_STATUS;
+var AT_RESPONSE;
+try {
+  var jr = JSON.parse(br.text);
+  AT_STATUS = String(jr.status != null ? jr.status : br.code);
+  AT_RESPONSE = String(jr.text != null ? jr.text : '');
+} catch (e1) {
+  AT_STATUS = String(br.code);
+  AT_RESPONSE = br.text;
+}
+END SCRIPT
+OUTPUT String @AT_STATUS
+OUTPUT String @AT_RESPONSE
+ENDBLOCK
+
+BLOCK:Keycheck
+  banIfNoMatch = False
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @AT_STATUS EqualTo "200"
+  KEYCHAIN FAIL OR
+    STRINGKEY @AT_STATUS DoesNotContain "200"
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:access_token
+  input = @AT_RESPONSE
+  leftDelim = "oauth_token="
+  rightDelim = "&"
+  MODE:LR
+  => VAR @access_token
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:access_token_secret
+  input = @AT_RESPONSE
+  leftDelim = "oauth_token_secret="
+  rightDelim = ""
+  MODE:LR
+  => VAR @access_token_secret
+ENDBLOCK
+
+BLOCK:Script
+INTERPRETER:NodeJS
+INPUT CK, CS, GT_URL, access_token, access_token_secret, UA
+BEGIN SCRIPT
+const crypto = require('crypto');
+const http = require('http');
+function bridgeExec(payload) {
+  return new Promise(function (resolve, reject) {
+    var data = JSON.stringify(payload);
+    var req = http.request({
+      hostname: '127.0.0.1',
+      port: 18765,
+      path: '/exec',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data, 'utf8') }
+    }, function (res) {
+      var chunks = [];
+      res.on('data', function (c) { chunks.push(c); });
+      res.on('end', function () {
+        resolve({ code: res.statusCode, text: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+function percentEncode(str) {
+  const buf = Buffer.from(String(str), 'utf8');
+  let o = '';
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 || b === 126)
+      o += String.fromCharCode(b);
+    else
+      o += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return o;
+}
+function buildOAuthHeader(method, url, consumerKey, consumerSecret, token, tokenSecret, extra) {
+  const oauth = {
+    oauth_consumer_key: String(consumerKey),
+    oauth_nonce: crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(Math.floor(Date.now() / 1000)),
+    oauth_version: '1.0'
+  };
+  if (token !== null && token !== undefined && String(token) !== '') oauth.oauth_token = String(token);
+  const sigParams = Object.assign({}, oauth, extra || {});
+  const enc = [];
+  for (const k of Object.keys(sigParams)) enc.push([percentEncode(k), percentEncode(String(sigParams[k]))]);
+  enc.sort((a, b) => {
+    const c = a[0].localeCompare(b[0]);
+    if (c !== 0) return c;
+    return a[1].localeCompare(b[1]);
+  });
+  const paramString = enc.map(([k, v]) => k + '=' + v).join('&');
+  const baseString = [method.toUpperCase(), percentEncode(url), percentEncode(paramString)].join('&');
+  const signingKey = percentEncode(consumerSecret) + '&' + percentEncode(tokenSecret);
+  const sig = crypto.createHmac('sha1', Buffer.from(signingKey, 'utf8')).update(Buffer.from(baseString, 'utf8')).digest('base64');
+  oauth.oauth_signature = sig;
+  const parts = [];
+  parts.push('oauth_consumer_key="' + percentEncode(oauth.oauth_consumer_key) + '"');
+  parts.push('oauth_nonce="' + percentEncode(oauth.oauth_nonce) + '"');
+  parts.push('oauth_signature_method="' + percentEncode(oauth.oauth_signature_method) + '"');
+  parts.push('oauth_timestamp="' + percentEncode(oauth.oauth_timestamp) + '"');
+  parts.push('oauth_version="' + percentEncode(oauth.oauth_version) + '"');
+  if (oauth.oauth_token !== undefined) parts.push('oauth_token="' + percentEncode(oauth.oauth_token) + '"');
+  parts.push('oauth_signature="' + percentEncode(oauth.oauth_signature) + '"');
+  return 'OAuth ' + parts.join(', ');
+}
+var gtAuth = buildOAuthHeader('GET', String(GT_URL), String(CK), String(CS), String(access_token), String(access_token_secret), {});
+var uaStr = String(UA);
+var hdrs = {
+  'accept': 'application/json',
+  'x-client-version': '26.1.5',
+  'accept-charset': 'UTF-8',
+  'accept-encoding': 'deflate;q=1.0,gzip;q=0.9',
+  'accept-language': 'fr-FR,fr;q=0.9',
+  'user-agent': uaStr,
+  'priority': 'u=3, i',
+  'Authorization': gtAuth
+};
+var br = await bridgeExec({ method: 'GET', url: String(GT_URL), headers: hdrs, body: '' });
+var GT_STATUS;
+var GT_RESPONSE;
+try {
+  var jr = JSON.parse(br.text);
+  GT_STATUS = String(jr.status != null ? jr.status : br.code);
+  GT_RESPONSE = String(jr.text != null ? jr.text : '');
+} catch (e1) {
+  GT_STATUS = String(br.code);
+  GT_RESPONSE = br.text;
+}
+END SCRIPT
+OUTPUT String @GT_STATUS
+OUTPUT String @GT_RESPONSE
+ENDBLOCK
+
+BLOCK:Keycheck
+  KEYCHAIN FAIL OR
+    STRINGKEY @GT_STATUS DoesNotContain "200"
+  KEYCHAIN SUCCESS OR
+    STRINGKEY @GT_RESPONSE Contains "\"status\":\"ok\""
+ENDBLOCK
+
+BLOCK:Parse
+LABEL:JWT
+  input = @GT_RESPONSE
+  leftDelim = "\"data\":\""
+  rightDelim = "\""
+  MODE:LR
+  => CAP @JWT
+ENDBLOCK
